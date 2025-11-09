@@ -9,37 +9,39 @@ from ludic.context.full_dialog import FullDialog
 async def run_episode(
     env: Env,
     agent: Agent,
-    max_steps,
-    sampling_args: SamplingArgs,
     *,
-    ctx: ContextStrategy = FullDialog(),
+    max_steps: int,
+    sampling_args: Optional[SamplingArgs] = None,
+    ctx: Optional[ContextStrategy] = None,
+    system_prompt: Optional[str] = None,
     timeout_s: Optional[float] = None,
 ) -> Rollout:
-    # seed system prompt from env if available
-    sys = env.suggested_sysprompt
-    if sys:
-        ctx.reset(system_prompt=sys)
-    else:
-        ctx.reset()
+    # context instance per episode
+    if ctx is None:
+        ctx = FullDialog()
 
-    rollout = Rollout(meta={"agent": getattr(agent, "name", "unknown"),
-                            "env": env.__class__.__name__,
-                            "ctx": ctx.__class__.__name__})
+    # choose system prompt priority: explicit > env-suggested > none
+    sys = system_prompt or env.suggested_sysprompt
+    ctx.reset(system_prompt=sys)
+
+    rollout = Rollout(meta={
+        "agent": getattr(agent, "name", "unknown"),
+        "env": env.__class__.__name__,
+        "ctx": ctx.__class__.__name__,
+    })
 
     obs, info = env.reset()
     ctx.on_env_reset(obs, info)
 
+    sargs: SamplingArgs = sampling_args or {}
+
     for t in range(max_steps):
         messages = ctx.on_before_act()
-        text = await agent.call(
-            messages=messages,
-            sampling_args=sampling_args,
-            timeout_s=timeout_s,
-        )
+        text = await agent.call(messages=messages, sampling_args=sargs, timeout_s=timeout_s)
         ctx.on_after_act(text)
         outcome: StepOutcome = env.step(text)
 
-        step = Step(
+        rollout.steps.append(Step(
             index=t,
             prev_obs=obs,
             action=text,
@@ -48,8 +50,7 @@ async def run_episode(
             truncated=outcome.truncated,
             terminated=outcome.terminated,
             info=outcome.info,
-        )
-        rollout.steps.append(step)
+        ))
 
         obs = outcome.obs
         ctx.on_after_step(obs, outcome.info)

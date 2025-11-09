@@ -9,16 +9,9 @@ class MockAgent(Agent):
     A trivial agent for testing. Always replies with "1".
     """
 
-    async def act(
-        self,
-        messages: List[Message],
-        sampling_args: SamplingArgs,
-        *,
-        max_tokens: int = 256,
-        seed: Optional[int] = None,
-        **kwargs: Any,
-    ) -> str:
+    async def act(self, messages, sampling_args, **kwargs) -> str:
         return "1"
+
 
 class MockEnv(Env):
     """
