@@ -16,8 +16,8 @@ async def test_happy_path_terminates_immediately():
 @pytest.mark.asyncio
 async def test_truncation_when_agent_is_wrong():
     class WrongClient(MockClient):
-        async def complete(self, *, model, messages, sampling_args):
-            return ChatResponse(text="nope"), {"used_args": sampling_args}
+        async def complete(self, *, model, messages, sampling):
+            return ChatResponse(text="nope"), {"used_args": sampling}
 
     env = MockEnv(max_steps=2, target="1")
     agent = Agent(client=WrongClient(), model="mock")

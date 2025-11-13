@@ -4,7 +4,8 @@ from typing import Any, Dict, List, Mapping, Optional, Protocol, Tuple
 
 import torch  # type: ignore
 
-from ludic.types import Message, SamplingArgs
+from ludic.types import Message
+from ludic.inference.sampling import SamplingConfig
 
 @dataclass
 class ChatResponse:
@@ -21,8 +22,8 @@ class ChatResponse:
 class ChatClient(Protocol):
     """
     Backend contract.
-      - validates SamplingArgs
-      - maps SamplingArgs -> backend kwargs
+      - accepts a fully-resolved SamplingConfig (defaults already applied)
+      - maps SamplingConfig -> backend kwargs
       - executes the call and returns (ChatResponse, info)
       - can atomically push a set of parameter tensors to the runtime
     """
@@ -32,7 +33,7 @@ class ChatClient(Protocol):
         *,
         model: str,
         messages: List[Message],
-        sampling_args: SamplingArgs,
+        sampling: SamplingConfig,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
         ...
 

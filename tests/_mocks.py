@@ -1,8 +1,9 @@
 from __future__ import annotations
 from typing import Any, Optional, List, Tuple, Mapping, Dict
 
-from ludic.types import Message, SamplingArgs, StepOutcome, Observation, Info
+from ludic.types import Message, StepOutcome, Observation, Info
 from ludic.inference.client import ChatResponse  # protocol impl not required
+from ludic.inference.sampling import SamplingConfig
 from ludic.agent import Agent
 from ludic.env import Env
 
@@ -13,9 +14,13 @@ class MockClient:
         self._text = text
 
     async def complete(
-        self, *, model: str, messages: List[Message], sampling_args: SamplingArgs
+        self,
+        *,
+        model: str,
+        messages: List[Message],
+        sampling: SamplingConfig,
     ) -> tuple[ChatResponse, Dict[str, Any]]:
-        return ChatResponse(text=self._text), {"used_args": sampling_args}
+        return ChatResponse(text=self._text), {"used_args": sampling}
 
     def push_update_atomic(self, params: Mapping[str, "torch.Tensor"], **kwargs) -> str:  # type: ignore[name-defined]
         return "mock-version"

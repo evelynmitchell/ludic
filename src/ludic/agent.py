@@ -1,13 +1,17 @@
 from __future__ import annotations
 import asyncio
 from typing import Any, Dict, List, Optional, Tuple
+
 from ludic.types import Message, SamplingArgs
 from ludic.inference.client import ChatClient, ChatResponse
+from ludic.inference.sampling import SamplingConfig, resolve_sampling_args
 
 class Agent:
     """
     Concrete agent that defines an interface that can be relied on.
-    Defers sampling-arg validation and completion to the underlying client.
+    Defers transport + low-level invocation to the underlying client, but
+    is responsible for resolving partial SamplingArgs into a fully-specified
+    SamplingConfig so backends do not have to guess or inject defaults.
     """
     name: str = "agent"
 
@@ -22,10 +26,13 @@ class Agent:
         sampling_args: SamplingArgs,
         timeout_s: Optional[float] = None,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
+        # Resolve partial SamplingArgs -> fully-specified SamplingConfig.
+        sampling: SamplingConfig = resolve_sampling_args(sampling_args)
+
         coro = self._client.complete(
             model=self._model,
             messages=messages,
-            sampling_args=sampling_args,
+            sampling=sampling,
         )
         if timeout_s is None:
             resp, info = await coro
