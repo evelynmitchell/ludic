@@ -21,20 +21,22 @@ log = logging.getLogger(__name__)
 
 class VLLMChatClient(ChatClient):
     """
-    vLLM ChatClient backed by a vLLM OpenAI-compatible server
-    + a NCCL-based weight update path.
+    vLLM ChatClient backed by:
+      - the OpenAI-compatible inference server
+      - an optional NCCL-based weight update path.
 
-    Design:
-      - The client can run in two modes:
-          * inference-only (enable_weight_updates=False):
-                - Only uses the OpenAI-compatible HTTP interface.
-                - Does NOT initialize NCCL or require a GPU on the client.
-                - Any attempt to push updates fails explicitly.
-          * training / update-capable (enable_weight_updates=True):
-                - Initializes a NCCL communicator to participate as an extra rank.
-                - Allows push_update_atomic() to broadcast weights to server workers.
-      - This keeps the inference-only use case lightweight while preserving
-        the full training/update path for specialized clients.
+    Modes:
+      * inference-only (enable_weight_updates=False):
+            - Only uses HTTP OpenAI API.
+            - No NCCL, no GPU expected on client side.
+            - Weight updates are disabled.
+      * training/update mode (enable_weight_updates=True):
+            - Client becomes an additional NCCL rank.
+            - Enables push_update_atomic() to broadcast updated parameters
+              directly into the vLLM worker processes.
+
+    The design ensures inference users stay lightweight, while specialized
+    fine-tuning / research clients get full direct NCCL streaming updates.
     """
 
     def __init__(
@@ -54,19 +56,15 @@ class VLLMChatClient(ChatClient):
         self.connection_timeout_s = connection_timeout_s
         self.enable_weight_updates = enable_weight_updates
 
-        # AsyncOpenAI handles /v1/chat/completions, etc.
+        # AsyncOpenAI handles the OpenAI-compatible HTTP endpoints.
         self._async_client = AsyncOpenAI(
             base_url=f"http://{self.host}:{self.port}/v1",
             api_key="local",
         )
 
-        # Sync HTTP for control-plane / health / weight-update RPC triggers
+        # Sync HTTP client for health checks and weight-update metadata RPC
         self._session = requests.Session()
-        adapter = HTTPAdapter(
-            pool_connections=10,
-            pool_maxsize=10,
-            max_retries=3,
-        )
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=3)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
 
@@ -74,12 +72,10 @@ class VLLMChatClient(ChatClient):
         self._pynccl_comm: Optional[PyNcclCommunicator] = None
         self._rank: Optional[int] = None
 
-        # Ensure server is reachable
+        # Verify server is reachable before continuing.
         self._check_server(self.connection_timeout_s)
 
-        # In inference-only mode, we intentionally skip NCCL initialization so
-        # the client can run without a local GPU and without any distributed
-        # setup. Weight updates are blocked in that mode.
+        # If weight updates are enabled, the client forms the extra NCCL rank.
         if self.enable_weight_updates:
             self._init_communicator()
             atexit.register(self.close_communicator)
@@ -88,26 +84,66 @@ class VLLMChatClient(ChatClient):
 
     async def complete(
         self,
+        interrupt_thinking: Optional[int] = None,
         *,
         model: str,
         messages: List[Message],
         sampling: SamplingConfig,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
-        # Map SamplingConfig -> OpenAI params
-        request_kwargs: Dict[str, Any] = dict(
-            model=model,
-            messages=messages,
-        )
+        """
+        interrupt_thinking → extra_body["vllm_xargs"]["max_think"]
+
+        This activates server-side GlobalThinkProcessor logic:
+          max_think = N means the model is forced to emit the token
+          sequence for </think> starting after N generated tokens.
+
+        Everything else in the sampling config is passed directly to
+        the OpenAI-compatible API without modification.
+        """
+
+        # Convert SamplingConfig → OpenAI API keyword arguments
+        request_kwargs: Dict[str, Any] = dict(model=model, messages=messages)
         request_kwargs.update(sampling.to_openai_kwargs())
 
+        # ----------------------------------------------------------
+        # Build extra_body container for vLLM-specific parameters.
+        # The OpenAI Python SDK rejects unknown top-level kwargs,
+        # so all vLLM-specific extensions go under extra_body.
+        # ----------------------------------------------------------
+        extra_body: Dict[str, Any] = {}
+
+        # Merge any extra_body already provided by SamplingConfig
+        existing_extra_body = request_kwargs.pop("extra_body", None)
+        if isinstance(existing_extra_body, dict):
+            extra_body.update(existing_extra_body)
+
+        # Extract or create vllm_xargs section
+        # (this is how the server exposes non-standard features)
+        vllm_xargs = extra_body.get("vllm_xargs", {})
+
+        # Thinking-limit support
+        if interrupt_thinking is not None:
+            if not isinstance(interrupt_thinking, int) or interrupt_thinking <= 0:
+                raise ValueError("interrupt_thinking must be a positive integer")
+            vllm_xargs["max_think"] = interrupt_thinking
+
+        # Persist vllm_xargs if present
+        if vllm_xargs:
+            extra_body["vllm_xargs"] = vllm_xargs
+
+        # Attach to request if non-empty
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        # Perform the inference request
         resp = await self._async_client.chat.completions.create(**request_kwargs)
 
         choice = resp.choices[0]
         text = choice.message.content or ""
         finish_reason = choice.finish_reason
 
-        # vLLM OpenAI server can optionally return logprobs, tokens, etc. in extras;
-        # for now, keep it minimal and put raw response into info.
+        # vLLM may return additional metadata in extras;
+        # we keep the raw response for debugging/introspection.
         chat_resp = ChatResponse(text=text, finish_reason=finish_reason)
         info: Dict[str, Any] = {
             "raw_response": resp.model_dump(exclude_none=True),
@@ -127,26 +163,27 @@ class VLLMChatClient(ChatClient):
         check_shapes: bool = True,
     ) -> str:
         """
-        Example implementation:
-          - for each named param:
-              * POST /update_named_param (name, dtype, shape)
-              * NCCL broadcast tensor from this client to workers
-          - optional reset_prefix_cache
-          - returns a version string (dummy or supplied)
+        Push updated model parameters into the running vLLM server.
+
+        For each param:
+            1. POST /update_named_param to broadcast metadata (name, dtype, shape)
+            2. NCCL broadcast the actual tensor payload from this client rank
+            3. (optional) reset prefix cache so the new weights affect KV reuse
+
+        Returns:
+            version string (either supplied or autogenerated)
         """
 
         if self._pynccl_comm is None or self._rank is None:
             if not self.enable_weight_updates:
                 raise RuntimeError(
-                    "push_update_atomic() called on an inference-only client "
-                    "(enable_weight_updates=False). Construct the client with "
-                    "enable_weight_updates=True to enable weight updates."
+                    "push_update_atomic() called on inference-only client "
+                    "(enable_weight_updates=False)."
                 )
-            raise RuntimeError(
-                "Communicator not initialized (NCCL setup failed or not completed)."
-            )
+            raise RuntimeError("Communicator not initialized.")
 
         start = time.time()
+
         for name, tensor in params.items():
             dtype, shape = str(tensor.dtype), tuple(tensor.shape)
             url = f"{self.server_url}/update_named_param"
@@ -154,21 +191,13 @@ class VLLMChatClient(ChatClient):
             try:
                 resp = self._session.post(
                     url,
-                    json={
-                        "name": name,
-                        "dtype": dtype,
-                        "shape": shape,
-                    },
+                    json={"name": name, "dtype": dtype, "shape": shape},
                     timeout=timeout_s,
                 )
             except Timeout:
-                raise TimeoutError(
-                    f"HTTP timeout when sending metadata for {name}"
-                )
+                raise TimeoutError(f"HTTP timeout during metadata send for {name}")
             except Exception as exc:
-                raise RuntimeError(
-                    f"Error sending metadata for {name}: {exc}"
-                ) from exc
+                raise RuntimeError(f"Error sending metadata for {name}: {exc}") from exc
 
             if resp.status_code != 200:
                 raise RuntimeError(
@@ -176,19 +205,17 @@ class VLLMChatClient(ChatClient):
                     f"{resp.status_code} {resp.text}"
                 )
 
-            # Now broadcast the actual tensor to all workers.
+            # Broadcast the parameter to vLLM worker processes
             self._pynccl_comm.broadcast(tensor, src=self._rank)
             self._pynccl_comm.group.barrier()
 
             if (time.time() - start) > timeout_s:
-                raise TimeoutError(
-                    f"push_update_atomic exceeded {timeout_s} seconds"
-                )
+                raise TimeoutError(f"push_update_atomic exceeded {timeout_s}s")
 
         if reset_cache:
             self.reset_prefix_cache()
 
-        # Optional: wait until server background tasks drained
+        # Wait for server background weight-update tasks to drain
         while self.get_num_background_tasks() > 0:
             time.sleep(0.2)
 
@@ -196,13 +223,14 @@ class VLLMChatClient(ChatClient):
 
     # ---- Control-plane helpers ---------------------------------
 
-    def _check_server(
-        self,
-        total_timeout: float = 0.0,
-        retry_interval: float = 2.0,
-    ):
+    def _check_server(self, total_timeout: float = 0.0, retry_interval: float = 2.0):
+        """
+        Poll /health until the server responds OK or timeout expires.
+        Ensures we don't start NCCL or inference before the server is alive.
+        """
         url = f"{self.server_url}/health"
         start_time = time.time()
+
         while True:
             try:
                 r = self._session.get(url, timeout=5.0)
@@ -217,35 +245,36 @@ class VLLMChatClient(ChatClient):
                     f"vLLM server not reachable at {self.host}:{self.port} "
                     f"after {total_timeout} seconds"
                 )
+
             log.info("vLLM server not ready, retrying...")
             time.sleep(retry_interval)
 
     def _init_communicator(self) -> None:
+        """
+        Establish the client's NCCL communicator:
+          * query world size from server
+          * tell server workers to initialize their communicator
+          * create client-side NCCL process group
+        """
+
         # 1) query world size
-        r = self._session.get(
-            f"{self.server_url}/get_world_size",
-            timeout=10.0,
-        )
+        r = self._session.get(f"{self.server_url}/get_world_size", timeout=10.0)
         r.raise_for_status()
         vllm_world_size = r.json()["world_size"]
-        world_size = vllm_world_size + 1
+        world_size = vllm_world_size + 1  # client is the extra rank
         self._rank = vllm_world_size
 
         # 2) ask server workers to init their communicators
         r = self._session.post(
             f"{self.server_url}/init_communicator",
-            json={
-                "host": self.host,
-                "port": self.group_port,
-                "world_size": world_size,
-            },
+            json={"host": self.host, "port": self.group_port, "world_size": world_size},
             timeout=30.0,
         )
         r.raise_for_status()
 
-        time.sleep(0.1)  # let server side spin up NCCL
+        time.sleep(0.1)  # let server initialize NCCL
 
-        # 3) create client-side process group
+        # 3) create the matching client-side communicator
         pg = StatelessProcessGroup.create(
             host=self.host,
             port=self.group_port,
@@ -256,26 +285,17 @@ class VLLMChatClient(ChatClient):
         self._pynccl_comm = PyNcclCommunicator(pg, device=device)
 
     def reset_prefix_cache(self) -> None:
-        r = self._session.post(
-            f"{self.server_url}/reset_prefix_cache",
-            timeout=30.0,
-        )
+        r = self._session.post(f"{self.server_url}/reset_prefix_cache", timeout=30.0)
         r.raise_for_status()
 
     def get_num_background_tasks(self) -> int:
-        r = self._session.post(
-            f"{self.server_url}/get_num_background_tasks",
-            timeout=10.0,
-        )
+        r = self._session.post(f"{self.server_url}/get_num_background_tasks", timeout=10.0)
         r.raise_for_status()
         return r.json()["num_background_tasks"]
 
     def close_communicator(self) -> None:
         try:
-            r = self._session.post(
-                f"{self.server_url}/close_communicator",
-                timeout=10.0,
-            )
+            r = self._session.post(f"{self.server_url}/close_communicator", timeout=10.0)
             if r.status_code != 200:
                 log.warning(
                     "close_communicator responded with %s %s",
@@ -283,5 +303,5 @@ class VLLMChatClient(ChatClient):
                     r.text,
                 )
         except ConnectionError:
-            # server might already be down
+            # server may already be down — nothing to do.
             pass

@@ -2,11 +2,16 @@ import asyncio
 import os
 import signal
 from argparse import Namespace
-from typing import Any, Awaitable, Sequence, Set
+from typing import Any, Awaitable, Sequence, Set, Optional
+
+# Use V1 engine explicitly.
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["VLLM_USE_V1"] = "1"
 
 import torch
 import uvloop
 from fastapi import FastAPI, Request
+from vllm import SamplingParams
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.parallel_state import get_world_group
 from vllm.distributed.utils import StatelessProcessGroup
@@ -24,9 +29,14 @@ from vllm.entrypoints.openai.cli_args import (
 )
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import FlexibleArgumentParser, set_ulimit
+from vllm.transformers_utils.tokenizer import init_tokenizer_from_configs
 
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
+# V1 logits-processor interface
+from vllm.v1.sample.logits_processor.interface import (
+    LogitsProcessor as V1LogitsProcessor,
+    BatchUpdate,
+    MoveDirectionality,
+)
 
 # ---------------------------------------------------------------------------
 # Global state for weight updates & background tasks
@@ -121,6 +131,116 @@ class WeightSyncWorkerExtension:
 
 
 # ---------------------------------------------------------------------------
+# Custom logits processor: inject "</think>" after N tokens (pure V1)
+# ---------------------------------------------------------------------------
+
+
+class GlobalThinkProcessor(V1LogitsProcessor):
+    """
+    Single V1 logits processor instance per worker.
+
+    For each request in the batch:
+      - On BatchUpdate.added, we inspect SamplingParams.extra_args["max_think"].
+      - If present and > 0, we remember:
+          * a live reference to that request's output_ids (list[int])
+          * its trigger_len
+      - On apply(logits), we walk each row and, if that request is within
+        its think-window, we force the next token of the '</think>' sequence.
+
+    In other words: we force the model to emit '</think>' after a
+    user-chosen number of generated tokens.
+    """
+
+    def __init__(self, vllm_config, device: torch.device, is_pin_memory: bool):
+        # Per-request state: req_idx -> {"output_ids": list[int], "trigger_len": int}
+        self.req_state: dict[int, dict[str, Any]] = {}
+        # Pre-tokenized think_ids injected into vllm_config BEFORE engine spawn
+        self.think_ids = vllm_config.additional_config.get("think_ids", [])
+
+    # ---- required by V1 interface ----
+
+    def is_argmax_invariant(self) -> bool:
+        # We overwrite logits and hence argmax, so no.
+        return False
+
+    def update_state(self, batch_update: Optional[BatchUpdate]) -> None:
+        """
+        Called whenever the persistent batch changes (add/remove/move),
+        *before* each forward pass.
+        """
+        if batch_update is None:
+            return
+
+        # 1) Handle removals
+        for ridx in batch_update.removed:
+            if ridx in self.req_state:
+                self.req_state.pop(ridx, None)
+
+        # 2) Handle additions
+        for (req_idx, params, prompt_ids, output_ids) in batch_update.added:
+            assert isinstance(params, SamplingParams)
+            extra_args = getattr(params, "extra_args", None)
+
+            trigger_len = None
+            if isinstance(extra_args, dict):
+                trigger_len = extra_args.get("max_think")
+
+            if not isinstance(trigger_len, int) or trigger_len <= 0:
+                self.req_state.pop(req_idx, None)
+                continue
+
+            self.req_state[req_idx] = {
+                "output_ids": output_ids,
+                "trigger_len": trigger_len,
+            }
+
+        # 3) Handle moves
+        for (src, dst, direction) in batch_update.moved:
+            if direction == MoveDirectionality.UNIDIRECTIONAL:
+                state = self.req_state.pop(src, None)
+                if state is not None:
+                    self.req_state[dst] = state
+            else:
+                s1 = self.req_state.get(src)
+                s2 = self.req_state.get(dst)
+                if s1 is not None or s2 is not None:
+                    self.req_state[src], self.req_state[dst] = s2, s1
+
+    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        logits: [batch_size, vocab_size]
+        We mutate rows in-place where we want to force '</think>'.
+        """
+        if not self.think_ids or not self.req_state:
+            return logits
+
+        batch_size = logits.shape[0]
+        think_ids = self.think_ids
+
+        for req_idx in range(batch_size):
+            state = self.req_state.get(req_idx)
+            if state is None:
+                continue
+
+            output_ids: list[int] = state["output_ids"]
+            trigger_len: int = state["trigger_len"]
+
+            seq_len = len(output_ids)
+            pos = seq_len - trigger_len
+
+            if pos < 0 or pos >= len(think_ids):
+                continue
+
+            forced_id = think_ids[pos]
+
+            row = logits[req_idx]
+            row.fill_(float("-inf"))
+            row[forced_id] = 0.0
+
+        return logits
+
+
+# ---------------------------------------------------------------------------
 # Server / app setup
 # ---------------------------------------------------------------------------
 
@@ -136,14 +256,57 @@ async def run_server(args: Namespace) -> None:
 
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Build vLLM engine with our worker extension
+    # ----------------------------------------------------------------------
+    # 1) Build engine_args from CLI and inject our extension + logits proc
+    # ----------------------------------------------------------------------
     engine_args = AsyncEngineArgs.from_cli_args(args)
-    # Adjust this string to the real import path of WeightSyncWorkerExtension
-    engine_args.worker_extension_cls = (
-        "ludic.inference.vllm_server.WeightSyncWorkerExtension"
+
+    # Wire worker extension
+    worker_ext = "ludic.inference.vllm_server.WeightSyncWorkerExtension"
+    engine_args.worker_extension_cls = worker_ext
+
+    # Wire our GlobalThinkProcessor into the engine-wide logits processor list.
+    # If user already passed --logits-processors, append ours.
+    think_proc = "ludic.inference.vllm_server:GlobalThinkProcessor"
+    if engine_args.logits_processors:
+        if think_proc not in engine_args.logits_processors:
+            engine_args.logits_processors.append(think_proc)
+    else:
+        engine_args.logits_processors = [think_proc]
+
+    # ----------------------------------------------------------------------
+    # 2) Build VllmConfig from engine_args (now containing logits_processors)
+    # ----------------------------------------------------------------------
+    vllm_config = engine_args.create_engine_config(
+        usage_context=UsageContext.OPENAI_API_SERVER
     )
-    engine = AsyncLLMEngine.from_engine_args(
-        engine_args, usage_context=UsageContext.OPENAI_API_SERVER
+
+    # --------------------------------------------------------------
+    # 3) Pre-tokenize '</think>' using the *same* tokenizer config
+    #    the engine will use. This is controller-side only.
+    # --------------------------------------------------------------
+    try:
+        tokenizer = init_tokenizer_from_configs(
+            model_config=vllm_config.model_config
+        )
+        think_ids = tokenizer.encode("</think>", add_special_tokens=False)
+        vllm_config.additional_config["think_ids"] = think_ids
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to pre-tokenize '</think>' for model "
+            f"{vllm_config.model_config.model}: {e}"
+        ) from e
+
+    # ----------------------------------------------------------------------
+    # 4) Build AsyncLLM engine from the prepared config.
+    #    At this point, vllm_config already knows about GlobalThinkProcessor
+    #    and think_ids. V1 will instantiate our logits processor on workers.
+    # ----------------------------------------------------------------------
+    engine = AsyncLLMEngine.from_vllm_config(
+        vllm_config=vllm_config,
+        usage_context=UsageContext.OPENAI_API_SERVER,
+        enable_log_requests=engine_args.enable_log_requests,
+        disable_log_stats=engine_args.disable_log_stats,
     )
 
     app: FastAPI = build_app(args)
@@ -266,8 +429,10 @@ async def run_server(args: Namespace) -> None:
 
     # ------------------------ start HTTP server --------------------------
 
-    vllm_config = await engine.get_vllm_config()
-    await init_app_state(engine, vllm_config, app.state, args)
+    vllm_config_live = await engine.get_vllm_config()
+    print(vllm_config_live)
+
+    await init_app_state(engine, vllm_config_live, app.state, args)
 
     shutdown_task = await serve_http(
         app,
