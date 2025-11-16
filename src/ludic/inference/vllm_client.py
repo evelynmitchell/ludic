@@ -45,7 +45,7 @@ class VLLMChatClient(ChatClient):
         host: str = "0.0.0.0",
         port: int = 8000,
         group_port: int = 51216,
-        connection_timeout_s: float = 0.0,
+        connection_timeout_s: float = 60,
         enable_weight_updates: bool = False,
     ) -> None:
 
