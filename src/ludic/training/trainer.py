@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -21,7 +22,6 @@ from ludic.training.types import SAWBatch, SAWItem, BatchSource
 # ---------------------------------------------------------------------------
 # Collation: SAWItems -> tensor batch
 # ---------------------------------------------------------------------------
-
 
 def _collate_saw_items(
     items: List[SAWItem],
@@ -88,17 +88,22 @@ def _collate_saw_items(
 
 class Trainer:
     """
-    Orchestrates the training loop:
+    Orchestrates the training loop with gradient accumulation:
 
-        BatchSource.next_batch() → SAWBatch
-          ↓
-        collate SAWBatch.items → tensors
-          ↓
-        RLAlgorithm.compute_loss(model, batch)
+        Loop `grad_accum_steps`:
+            BatchSource.next_batch() → micro-batch
+              ↓
+            collate → tensors
+              ↓
+            RLAlgorithm.compute_loss(model, batch)
+              ↓
+            scaled_loss.backward() (with FSDP.no_sync())
           ↓
         optimizer.step()
           ↓
-        Agent.push_policy_update(...)   # optional, online weight sync
+        optimizer.zero_grad()  # <-- Grads freed
+          ↓
+        Agent.push_policy_update(...)   # <-- Sync
 
     Trainer is agnostic to envs, contexts, rollouts, and tokenization.
 
@@ -146,10 +151,12 @@ class Trainer:
                 Used for pushing updated weights into the runtime.
 
             cfg:
-                TrainerConfig for device, optimizer hyperparams, pad_token_id, etc.
+                TrainerConfig for device, optimizer hyperparams, pad_token_id,
+                and `grad_accum_steps`.
 
             sync_every_steps:
-                Push the updated weights every n steps to the inference engine.
+                Push the updated weights every n *macro-steps* to the
+                inference engine.
 
             param_filter:
                 Optional predicate (name, Tensor) -> bool deciding which
@@ -172,6 +179,9 @@ class Trainer:
 
         # Initialize optimizer
         self.optimizer = self.initialize_optimizer()
+
+        # Assume gradients are zeroed at init
+        self.optimizer.zero_grad(set_to_none=True)
 
     # ------------------------------------------------------------------
     # Optimizer initialization
@@ -198,69 +208,148 @@ class Trainer:
         )
 
     # ------------------------------------------------------------------
-    # Core async train step
+    # Core async train step (now a "macro-step")
     # ------------------------------------------------------------------
 
     async def train_step(self) -> Dict[str, float]:
         """
-        One full RL step:
+        One full "macro" RL step with gradient accumulation:
 
-            - sample SAWBatch from BatchSource
-            - collate to tensors
-            - compute loss via algo.compute_loss
-            - backward + optimizer step
-            - optionally push updated params into runtime
+            - Accumulate gradients over `cfg.grad_accum_steps` micro-batches
+            - Perform one optimizer step
+            - Free gradients
+            - Optionally push updated params into runtime
 
         Returns:
-            stats dict with at least:
-                - "loss"
-                - "train_step"
-                - "batch_items"
-                - "batch_size"
-                - "avg_total_reward"
-            plus whatever the Loss implementation adds.
+            Aggregated stats dict from all micro-batches.
         """
         device = torch.device(self.cfg.model_device)
+        grad_accum_steps = getattr(self.cfg, "grad_accum_steps", 1)
+        if grad_accum_steps < 1:
+            grad_accum_steps = 1
 
-        # ---- 1) Sample batch from source -------------------------------
-        saw_batch: SAWBatch = await self._batch_source.next_batch()
+        all_micro_stats: List[Dict[str, float]] = []
+        all_saw_batches: List[SAWBatch] = []
 
-        # ---- 2) Collate into tensors -----------------------------------
-        batch_tensors = _collate_saw_items(
-            saw_batch.items,
-            pad_token_id=self.cfg.pad_token_id,
-            device=device,
-        )
-
-        # ---- 3) Loss + backward ----------------------------------------
+        # ---- 1) Accumulation Loop (Micro-Steps) ------------------------
+        
+        # Note: Gradients are *not* zeroed here. They are accumulated
+        # from the previous state (which should be zero).
         self.model.train()
-        self.optimizer.zero_grad(set_to_none=True)
 
-        loss, stats = self.algo.compute_loss(self.model, batch_tensors)
-        loss.backward()
+        for micro_step_idx in range(grad_accum_steps):
+            # ---- 1a) Sample micro-batch --------------------------------
+            saw_batch: SAWBatch = await self._batch_source.next_batch()
+            all_saw_batches.append(saw_batch)
 
-        if self.cfg.max_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.cfg.max_grad_norm,
+            # ---- 1b) Collate into tensors ------------------------------
+            batch_tensors = _collate_saw_items(
+                saw_batch.items,
+                pad_token_id=self.cfg.pad_token_id,
+                device=device,
             )
 
+            # ---- 1c) FSDP: context for no_sync -------------------------
+            # We only sync (all-reduce) gradients on the *last* micro-batch
+            is_last_micro = (micro_step_idx == grad_accum_steps - 1)
+            no_sync_context = (
+                self.model.no_sync()
+                if (isinstance(self.model, FSDP) and not is_last_micro)
+                else contextlib.nullcontext()
+            )
+
+            # ---- 1d) Loss + backward (scaled) --------------------------
+            with no_sync_context:
+                loss, stats = self.algo.compute_loss(self.model, batch_tensors)
+                
+                # Scale loss for accumulation
+                scaled_loss = loss / grad_accum_steps
+                scaled_loss.backward()
+
+            all_micro_stats.append(stats)
+
+        # ---- 2) Gradient Clipping (after loop) -------------------------
+        if self.cfg.max_grad_norm is not None:
+            # FSDP requires calling clip_grad_norm_ *on the model*
+            # to handle unsharding grads before clipping.
+            if isinstance(self.model, FSDP):
+                self.model.clip_grad_norm_(self.cfg.max_grad_norm)
+            else:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.cfg.max_grad_norm,
+                )
+
+        # ---- 3) Optimizer Step (one step for the macro-batch) ----------
         self.optimizer.step()
+
+        # ---- 4) Free Gradients (as requested) --------------------------
+        # Grads are freed *after* step and *before* weight sync
+        self.optimizer.zero_grad(set_to_none=True)
 
         self._train_step_idx += 1
 
-        # ---- 4) Push policy update into runtime ------------------------
+        # ---- 5) Push policy update into runtime ------------------------
         if self._train_step_idx % self.sync_every_steps == 0:
             self._push_weights_to_runtime()
 
-        # ---- 5) Enrich stats -------------------------------------------
-        stats = dict(stats)
-        stats["train_step"] = float(self._train_step_idx)
-        stats["batch_items"] = float(len(saw_batch.items))
-        stats["batch_size"] = float(saw_batch.meta.get("batch_size", 0.0))
-        stats["avg_total_reward"] = float(saw_batch.meta.get("avg_total_reward", 0.0))
+        # ---- 6) Enrich stats -------------------------------------------
+        final_stats = self._aggregate_stats(all_micro_stats, all_saw_batches)
+        final_stats["train_step"] = float(self._train_step_idx)
 
-        return stats
+        return final_stats
+
+    def _aggregate_stats(
+        self,
+        micro_stats_list: List[Dict[str, float]],
+        saw_batches: List[SAWBatch],
+    ) -> Dict[str, float]:
+        """
+        Aggregate stats from all micro-batches into a single dict for logging.
+        - Averages all keys from micro_stats_list (e.g., "loss")
+        - Sums "batch_items" and "batch_size" from saw_batches
+        - Computes a weighted average of "avg_total_reward"
+        """
+        if not micro_stats_list:
+            return {}
+
+        # Initialize aggregated stats from the keys of the first micro-batch
+        agg_stats: Dict[str, float] = {k: 0.0 for k in micro_stats_list[0].keys()}
+        num_micro_batches = len(micro_stats_list)
+
+        # Average all stats from the 'stats' dicts (e.g., loss)
+        for micro_stats in micro_stats_list:
+            for k, v in micro_stats.items():
+                if k in agg_stats:
+                    agg_stats[k] += v
+        
+        for k in agg_stats:
+            agg_stats[k] /= num_micro_batches # Average the values
+
+        # Sum/Average stats from the SAWBatch metadata
+        total_items = 0.0
+        total_batch_size = 0.0
+        total_reward_sum = 0.0 # To calculate the new weighted average
+
+        for batch in saw_batches:
+            num_items = float(len(batch.items))
+            total_items += num_items
+            
+            batch_size = float(batch.meta.get("batch_size", 0.0))
+            avg_reward = float(batch.meta.get("avg_total_reward", 0.0))
+            
+            total_batch_size += batch_size
+            total_reward_sum += avg_reward * num_items # Weight by items
+
+        agg_stats["batch_items"] = total_items # Total items in macro-batch
+        agg_stats["batch_size"] = total_batch_size # Total tokens/etc in macro-batch
+        
+        if total_items > 0:
+             agg_stats["avg_total_reward"] = total_reward_sum / total_items
+        else:
+             agg_stats["avg_total_reward"] = 0.0
+
+        return agg_stats
 
     # ------------------------------------------------------------------
     # Sync wrappers for non-async callers
