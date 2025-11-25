@@ -1,92 +1,78 @@
-# examples/rollout_engine_example.py
-
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Dict, List
+from typing import List, Dict, Any
 
 from ludic.agent import Agent
-from ludic.context.base import ContextStrategy
-from ludic.types import Rollout
-
+from ludic.context.full_dialog import FullDialog
+from ludic.inference.vllm_client import VLLMChatClient
+from ludic.parsers import xml_move_parser
+from ludic.training.rollout_engine import (
+    RolloutEngine,
+    EnvRegistry,
+    CtxRegistry,
+)
 from ludic.training.types import (
     CtxSpec,
     EnvSpec,
     RolloutRequest,
-    SamplingArgs,
 )
+from ludic.types import Rollout, SamplingArgs
 
-# Adjust this import to wherever you actually placed RolloutEngine
-from ludic.training.rollout_engine import RolloutEngine, EnvRegistry, CtxRegistry
-
-from examples.envs.tictactoe import TicTacToeEnv
+# Adjust this import path to where your env actually is
+from envs.tic_tac_toe import TicTacToeEnv
 
 
 # ---------------------------------------------------------------------------
-# Minimal context strategy (if you don't already have one handy)
+# vLLM / model config
 # ---------------------------------------------------------------------------
 
-class NoopContext(ContextStrategy):
+VLLM_HOST = "127.0.0.1"
+VLLM_PORT = 8000
+MODEL_NAME = "Qwen/Qwen3-0.6B"
+
+JSONL_PATH = Path("outputs/tictactoe_rollouts_heterogeneous.xml.jsonl")
+
+
+# ---------------------------------------------------------------------------
+# System prompt glue (same pattern as your other script)
+# ---------------------------------------------------------------------------
+
+def build_system_prompt(env_cls: type[TicTacToeEnv] = TicTacToeEnv) -> str:
     """
-    Ultra-minimal ContextStrategy used just to make Tic-Tac-Toe work.
-
-    If your codebase already has a proper ContextStrategy implementation
-    (e.g. chat-style context), feel free to delete this and plug that in
-    instead. This class is intentionally dumb.
+    Take the env's suggested_sysprompt and append the XML contract line.
+    Env stays parser-agnostic; XML is enforced by the parser.
     """
+    env_for_prompt = env_cls()
+    base = env_for_prompt.suggested_sysprompt or ""
+    extra = """
+When you choose a move, respond ONLY with a single XML tag containing the move,
+for example:
 
-    def __init__(self) -> None:
-        super().__init__()
+    <move>A1</move>
 
-    def reset(self) -> None:
-        # No state to reset
-        pass
-
-    def update(self, *, obs: str, action: str | None = None) -> None:
-        # No state, so nothing to do
-        return
-
-    def build_prompt(self, *, system_prompt: str | None, obs: str) -> str:
-        """
-        Build a naive single-turn prompt for the agent.
-
-        A real implementation would track conversation history etc.
-        """
-        parts: List[str] = []
-        if system_prompt:
-            parts.append(system_prompt.strip())
-            parts.append("")  # blank line
-        parts.append(obs)
-        parts.append("")
-        parts.append("Your move:")
-        return "\n".join(parts)
+Do not include any other text, commentary, or tags.
+"""
+    return (base.rstrip() + "\n\n" + extra.strip()).strip()
 
 
 # ---------------------------------------------------------------------------
-# Agent factory
+# Agent
 # ---------------------------------------------------------------------------
 
 def build_agent() -> Agent:
     """
-    Construct whatever Agent you normally use in Ludic.
-
-    This is intentionally left as a single hook so you only edit in one place.
-    For example, you might do something like:
-
-        from ludic.agent.openai import OpenAIChatAgent
-
-        return OpenAIChatAgent(
-            model="gpt-4.1-mini",
-            temperature=0.0,
-        )
-
-    For now this just raises to force you to wire *something* real in.
+    Standard Ludic Agent backed by a VLLMChatClient.
+    Expects a vLLM server already running with an OpenAI-compatible API.
     """
-    raise RuntimeError(
-        "Implement build_agent() to return a concrete ludic.Agent "
-        "(OpenAI / local model / etc.)"
+    client = VLLMChatClient(
+        host=VLLM_HOST,
+        port=VLLM_PORT,
+        connection_timeout_s=300.0,  # generous for first model load
+        enable_weight_updates=False,
     )
+    return Agent(client=client, model=MODEL_NAME)
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +86,7 @@ def make_env_registry() -> EnvRegistry:
     - ttt_agent_first:    agent plays first (X goes first)
     - ttt_opponent_first: opponent makes a random opening move
 
-    This gives us heterogeneous envs while reusing the same TicTacToeEnv class.
+    Heterogeneity is just the `agent_starts` flag.
     """
     return {
         "ttt_agent_first": lambda **kwargs: TicTacToeEnv(
@@ -118,18 +104,15 @@ def make_env_registry() -> EnvRegistry:
 
 def make_ctx_registry() -> CtxRegistry:
     """
-    Two context kinds just so we can prove heterogeneity at the ctx layer too.
-
-    In practice you'll probably just use a single chat-style context everywhere.
+    Single context kind using the built-in FullDialog context.
     """
     return {
-        "noop": lambda **kwargs: NoopContext(),
-        # You can add more exotic context strategies here later.
+        "full_dialog": lambda **kwargs: FullDialog(**kwargs),
     }
 
 
 # ---------------------------------------------------------------------------
-# Rollout request factory
+# Rollout request factory (with XML parser wired in)
 # ---------------------------------------------------------------------------
 
 def make_rollout_requests() -> List[RolloutRequest]:
@@ -139,23 +122,28 @@ def make_rollout_requests() -> List[RolloutRequest]:
     - 3 episodes where the agent starts
     - 3 episodes where the opponent plays first
 
-    Both share the same context kind ("noop") to keep the example simple.
+    Both use FullDialog and the same XML system prompt.
     """
-    # Shared sampling arguments; adjust if your Agent uses them.
-    sargs: SamplingArgs = {"temperature": 0.0}
+    sampling_args: SamplingArgs = {
+        "temperature": 0.7,
+        "max_tokens": 2000,
+    }
+
+    system_prompt = build_system_prompt()
 
     req_agent_first = RolloutRequest(
         env=EnvSpec(
             kind="ttt_agent_first",
-            kwargs={},   # could pass custom kwargs into TicTacToeEnv here
+            kwargs={},
         ),
         ctx=CtxSpec(
-            kind="noop",
+            kind="full_dialog",
             kwargs={},
         ),
         num_episodes=3,
-        sampling_args=sargs,
-        system_prompt=None,   # fall back to env.suggested_sysprompt inside run_episode if you do that
+        sampling_args=sampling_args,
+        system_prompt=system_prompt,
+        action_parser=xml_move_parser,  # <-- XML action parser here
         meta={"label": "agent_first"},
     )
 
@@ -165,12 +153,13 @@ def make_rollout_requests() -> List[RolloutRequest]:
             kwargs={},
         ),
         ctx=CtxSpec(
-            kind="noop",
+            kind="full_dialog",
             kwargs={},
         ),
         num_episodes=3,
-        sampling_args=sargs,
-        system_prompt=None,
+        sampling_args=sampling_args,
+        system_prompt=system_prompt,
+        action_parser=xml_move_parser,  # <-- same XML parser
         meta={"label": "opponent_first"},
     )
 
@@ -185,10 +174,9 @@ def assert_heterogeneous_envs(rollouts: List[Rollout]) -> None:
     """
     Sanity-checks:
 
-    - We got the expected number of episodes.
-    - Both env kinds appear in the metadata.
-    - The observations behave differently depending on whether the opponent
-      moves first (opening obs should mention an opponent move).
+    - Both env labels appear.
+    - Both env kinds appear.
+    - Opponent-first games show an opening opponent move in the first obs.
     """
     assert rollouts, "No rollouts returned, something is broken."
 
@@ -202,25 +190,25 @@ def assert_heterogeneous_envs(rollouts: List[Rollout]) -> None:
         f"Expected two env kinds, got {env_kinds}"
     )
 
-    # Check that opponent-first games actually start with an opponent move
+    # This assumes your env sticks this marker into the text when O moves.
+    opp_tag = "Opponent (O) played at"
     saw_agent_first_clean = False
     saw_opponent_first_opening = False
 
     for r in rollouts:
+        if not r.steps:
+            continue
+
         label = r.meta["request_meta"]["label"]
-        # First step prev_obs is what the agent saw before its first move
         first_step = r.steps[0]
         prev_obs: str = first_step.prev_obs
 
-        opp_tag = "Opponent (O) played at"
         has_opening_opp = opp_tag in prev_obs
 
         if label == "agent_first":
-            # In this configuration, the opponent should NOT have played yet.
             if not has_opening_opp:
                 saw_agent_first_clean = True
         elif label == "opponent_first":
-            # Here the opponent should have already made a random move.
             if has_opening_opp:
                 saw_opponent_first_opening = True
 
@@ -251,29 +239,32 @@ def assert_episode_indices(rollouts: List[Rollout]) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    # 1) Build agent + registries
-    agent = build_agent()  # <-- you must implement this function
+    print(
+        f"Connecting to vLLM at http://{VLLM_HOST}:{VLLM_PORT} "
+        f"using model {MODEL_NAME}..."
+    )
+
+    agent = build_agent()
     env_registry: EnvRegistry = make_env_registry()
     ctx_registry: CtxRegistry = make_ctx_registry()
 
-    jsonl_path = Path("outputs/tictactoe_rollouts.jsonl")
-    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    JSONL_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     engine = RolloutEngine(
         agent=agent,
         env_registry=env_registry,
         ctx_registry=ctx_registry,
-        jsonl_path=str(jsonl_path),
+        jsonl_path=str(JSONL_PATH),
     )
 
-    # 2) Build heterogeneous rollout requests
+    # 1) Build heterogeneous rollout requests (with XML parser + system prompt)
     requests = make_rollout_requests()
 
-    # 3) Run rollouts
+    # 2) Run rollouts through the engine
     rollouts = await engine.generate_rollouts(
         requests=requests,
         max_steps=9,        # Tic-Tac-Toe can't be longer than 9 moves
-        timeout_s=30.0,
+        timeout_s=60.0,
         concurrency=4,
     )
 
@@ -286,14 +277,16 @@ async def main() -> None:
             f"| total_reward={r.total_reward:.1f} | length={r.length}"
         )
 
-    # 4) Assertions: check that heterogeneity & engine metadata behave as expected
+    # 3) Assertions: check that heterogeneity & engine metadata behave as expected
     assert_heterogeneous_envs(rollouts)
     assert_episode_indices(rollouts)
 
     print()
-    print(f"Rollouts written to: {jsonl_path.resolve()}")
+    print(f"Rollouts written to: {JSONL_PATH.resolve()}")
     print("All assertions passed ✅")
 
 
 if __name__ == "__main__":
+    # Expect vLLM server already running, e.g.:
+    #   python -m ludic.inference.vllm_server --model Qwen/Qwen3-0.6B --port 8000 ...
     asyncio.run(main())

@@ -1,8 +1,7 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import List, Optional
-from ludic.inference.client import ChatResponse
-from ludic.types import Message, Observation, Info
+from ludic.types import Message, Observation, Info, ChatResponse
 
 class ContextStrategy(ABC):
     """

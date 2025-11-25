@@ -12,8 +12,8 @@ from requests.exceptions import RequestException, Timeout
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.utils import StatelessProcessGroup
 
-from ludic.types import Message
-from ludic.inference.client import ChatClient, ChatResponse
+from ludic.types import Message, ChatResponse
+from ludic.inference.client import ChatClient
 from ludic.inference.sampling import SamplingConfig
 
 log = logging.getLogger(__name__)

@@ -4,20 +4,8 @@ from typing import Any, Dict, List, Mapping, Optional, Protocol, Tuple
 
 import torch  # type: ignore
 
-from ludic.types import Message
+from ludic.types import Message, ChatResponse
 from ludic.inference.sampling import SamplingConfig
-
-@dataclass
-class ChatResponse:
-    """
-    Normalized inference output for training/logging.
-    Keep this minimal. Put transport/vendor junk in the returned `info` dict.
-    """
-    text: str
-    completion_token_ids: Optional[List[int]] = None
-    logprobs: Optional[List[float]] = None
-    finish_reason: Optional[str] = None
-    prompt_token_ids: Optional[List[int]] = None
 
 class ChatClient(Protocol):
     """

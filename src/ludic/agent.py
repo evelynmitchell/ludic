@@ -4,8 +4,8 @@ from typing import Any, Dict, List, Optional, Tuple, Mapping
 
 import torch
 
-from ludic.types import Message, SamplingArgs
-from ludic.inference.client import ChatClient, ChatResponse
+from ludic.types import Message, SamplingArgs, ChatResponse
+from ludic.inference.client import ChatClient
 from ludic.inference.sampling import SamplingConfig, resolve_sampling_args
 
 
