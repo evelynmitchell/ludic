@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from ludic.env import Env
+from ludic.envs.single_agent_env import SingleAgentEnv
 from ludic.types import Observation, Info, StepOutcome
 
 
@@ -39,7 +39,7 @@ class _GameResult:
     draw: bool
 
 
-class TicTacToeEnv(Env):
+class TicTacToeEnv(SingleAgentEnv):
     """
     Minimal Tic-Tac-Toe environment for Ludic.
 
@@ -77,6 +77,7 @@ class TicTacToeEnv(Env):
                 If True, the observation string will mention the last
                 opponent move explicitly.
         """
+        # SingleAgentEnv defaults the agent identifier to "agent_0"
         super().__init__()
         self.agent_mark = "X"
         self.opponent_mark = "O"
@@ -89,7 +90,7 @@ class TicTacToeEnv(Env):
         self._obs_cache: Observation = ""
 
     # ------------------------------------------------------------------
-    # Env interface
+    # Env interface (SingleAgentEnv implementation)
     # ------------------------------------------------------------------
 
     @property
@@ -101,7 +102,7 @@ class TicTacToeEnv(Env):
             "A move is written like A1, B2, C3, etc."
         )
 
-    def reset(self, *, seed: Optional[int] = None) -> Tuple[Observation, Info]:
+    def env_reset(self, *, seed: Optional[int] = None) -> Tuple[Observation, Info]:
         if seed is not None:
             random.seed(seed)
 
@@ -119,7 +120,7 @@ class TicTacToeEnv(Env):
         }
         return obs, info
 
-    def step(self, action: str) -> StepOutcome:
+    def env_step(self, action: str) -> StepOutcome:
         """
         `action` is a coordinate string like "A1", "b3", etc.
 
@@ -227,7 +228,7 @@ class TicTacToeEnv(Env):
             info=info,
         )
 
-    def current_obs(self) -> Observation:
+    def env_current_obs(self) -> Observation:
         return self._obs_cache
 
     # ------------------------------------------------------------------
