@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -18,6 +19,7 @@ from ludic.training.algorithm import RLAlgorithm
 from ludic.training.config import TrainerConfig
 from ludic.training.types import SAWBatch, SAWItem, BatchSource
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Collation: SAWItems -> tensor batch
@@ -126,6 +128,7 @@ class Trainer:
         publisher: PolicyPublisher,
         cfg: TrainerConfig = TrainerConfig(),
         param_filter: Optional[Callable[[str, Tensor], bool]] = None,
+        enable_gradient_checkpointing: bool = False,
     ) -> None:
         """
         Args:
@@ -150,9 +153,11 @@ class Trainer:
 
             param_filter:
                 Optional predicate (name, Tensor) -> bool deciding which
-                parameters get pushed into the runtime. If None, defaults to
-                `p.requires_grad` for non-FSDP models; for FSDP, no default
-                filter (caller should pass one if they want to restrict).
+                parameters get pushed into the runtime.
+
+            enable_gradient_checkpointing:
+                If True, enables activation checkpointing on the model to save VRAM.
+                Also automatically disables KV cache and enables input gradients.
         """
         self.cfg = cfg
 
@@ -166,6 +171,29 @@ class Trainer:
         self.sync_every_steps = self.cfg.sync_every_steps
         self.param_filter = param_filter
         self._train_step_idx = 0
+
+        # ---- Gradient Checkpointing Setup ----------------------------
+        if enable_gradient_checkpointing:
+            logger.info("🛡️ Enabling Gradient Checkpointing (Activation Checkpointing)...")
+            
+            # 1. Enable on the model (HuggingFace standard API)
+            if hasattr(self.model, "gradient_checkpointing_enable"):
+                self.model.gradient_checkpointing_enable()
+            else:
+                logger.warning("⚠️ Model does not have 'gradient_checkpointing_enable' method.")
+
+            # 2. Disable KV Cache (incompatible with checkpointing + training)
+            if hasattr(self.model, "config"):
+                self.model.config.use_cache = False
+
+            # 3. Enable input gradients
+            # This is often required so that gradients can flow through the checkpointed segments.
+            if hasattr(self.model, "enable_input_require_grads"):
+                self.model.enable_input_require_grads()
+            else:
+                # Fallback for generic torch modules if needed, though usually HF specific
+                pass
+        # --------------------------------------------------------------
 
         # Initialize optimizer
         self.optimizer = self.initialize_optimizer()
@@ -232,11 +260,25 @@ class Trainer:
             saw_batch: SAWBatch = await self._batch_source.next_batch()
             all_saw_batches.append(saw_batch)
 
+            # Debug: Check batch size before collation to diagnose OOM
+            item_count = len(saw_batch.items)
+            logger.info(
+                f"[Micro-step {micro_step_idx+1}/{grad_accum_steps}] "
+                f"Received {item_count} SAWItems."
+            )
+
             # ---- 1b) Collate into tensors ------------------------------
             batch_tensors = _collate_saw_items(
                 saw_batch.items,
                 pad_token_id=self.cfg.pad_token_id,
                 device=device,
+            )
+
+            # Debug: Check tensor shape [Batch, Time]
+            input_shape = batch_tensors["input_ids"].shape
+            logger.info(
+                f"    -> Collated Tensor Shape: {input_shape} "
+                f"(Batch={input_shape[0]}, SeqLen={input_shape[1]})"
             )
 
             # ---- 1c) FSDP: context for no_sync -------------------------
@@ -295,49 +337,76 @@ class Trainer:
         saw_batches: List[SAWBatch],
     ) -> Dict[str, float]:
         """
-        Aggregate stats from all micro-batches into a single dict for logging.
-        - Averages all keys from micro_stats_list (e.g., "loss")
-        - Sums "batch_items" and "batch_size" from saw_batches
-        - Computes a weighted average of "avg_total_reward"
+        Aggregate stats, including custom metrics from item metadata.
         """
         if not micro_stats_list:
             return {}
 
-        # Initialize aggregated stats from the keys of the first micro-batch
+        # 1. Standard Loss/Grad Stats
         agg_stats: Dict[str, float] = {k: 0.0 for k in micro_stats_list[0].keys()}
         num_micro_batches = len(micro_stats_list)
 
-        # Average all stats from the 'stats' dicts (e.g., loss)
         for micro_stats in micro_stats_list:
             for k, v in micro_stats.items():
                 if k in agg_stats:
                     agg_stats[k] += v
 
         for k in agg_stats:
-            agg_stats[k] /= num_micro_batches  # Average the values
+            agg_stats[k] /= num_micro_batches
 
-        # Sum/Average stats from the SAWBatch metadata
+        # 2. Batch Metadata Stats (Reward, Size)
         total_items = 0.0
-        total_batch_size = 0.0
-        total_reward_sum = 0.0  # To calculate the new weighted average
+        total_episodes = 0.0
+        total_reward_sum = 0.0 
+
+        # 3. Custom Counters (Syntax, Semantics, Outcomes)
+        counts = {"syntax_err": 0.0, "semantic_err": 0.0, "win": 0.0, "loss": 0.0, "draw": 0.0}
 
         for batch in saw_batches:
             num_items = float(len(batch.items))
             total_items += num_items
-
-            batch_size = float(batch.meta.get("batch_size", 0.0))
+            
+            # Each batch has N episodes
+            batch_eps = float(batch.meta.get("batch_size", 0.0))
+            total_episodes += batch_eps
+            
+            # Weighted reward average
             avg_reward = float(batch.meta.get("avg_total_reward", 0.0))
+            total_reward_sum += avg_reward * num_items
 
-            total_batch_size += batch_size
-            total_reward_sum += avg_reward * num_items  # Weight by items
+            # Scan items for specific flags set by Agent/Env
+            for item in batch.items:
+                # Syntax Error (Agent output invalid XML)
+                if item.meta.get("parse_error"):
+                    counts["syntax_err"] += 1.0
+                
+                # Semantic Error (Agent output valid XML but invalid move)
+                if item.meta.get("illegal_move"):
+                    counts["semantic_err"] += 1.0
+                
+                # Outcomes (usually only present on the final step)
+                res = item.meta.get("result") # "win", "loss", "draw"
+                if res in counts:
+                    counts[res] += 1.0
 
-        agg_stats["batch_items"] = total_items  # Total items in macro-batch
-        agg_stats["batch_size"] = total_batch_size  # Total episodes/etc in macro-batch
+        agg_stats["batch_items"] = total_items
+        agg_stats["batch_size"] = total_episodes
 
         if total_items > 0:
             agg_stats["avg_total_reward"] = total_reward_sum / total_items
+            # Error rates are per step (decision)
+            agg_stats["err_syntax"] = counts["syntax_err"] / total_items
+            agg_stats["err_semantic"] = counts["semantic_err"] / total_items
         else:
             agg_stats["avg_total_reward"] = 0.0
+            agg_stats["err_syntax"] = 0.0
+            agg_stats["err_semantic"] = 0.0
+
+        if total_episodes > 0:
+            # Outcome rates are per episode
+            agg_stats["rate_win"] = counts["win"] / total_episodes
+            agg_stats["rate_loss"] = counts["loss"] / total_episodes
+            agg_stats["rate_draw"] = counts["draw"] / total_episodes
 
         return agg_stats
 
@@ -392,79 +461,117 @@ class Trainer:
         asyncio.run(self.train(num_steps, log_every=log_every, log_fn=log_fn))
 
     # ------------------------------------------------------------------
-    # Weight sync into runtime via Agent (FSDP-aware)
+    # Weight sync into runtime via Agent (FSDP-aware + LoRA-aware)
     # ------------------------------------------------------------------
 
     def _push_weights_to_runtime(self) -> None:
         """
         Gather weights (handling FSDP if needed) and publish them.
 
-        FSDP-aware behavior:
-
-            - If model is FSDP:
-                * only rank 0 (if dist initialized) does anything
-                * uses FULL_STATE_DICT with rank0_only=True
-                * gathers a full, unsharded state_dict on model_device
-                * optionally filters params, then hands the dict to Client
-
-            - If model is not FSDP:
-                * uses named_parameters() with the same filter policy.
-
-        Note: this assumes that the runtime (e.g. vLLM client) expects tensors
-        on the device implied by cfg.runtime_device (or cfg.model_device if None),
-        and will use NCCL from there. If you care, set cfg.runtime_device
-        accordingly.
+        If the model is a PEFT/LoRA model, we strictly follow the
+        Merge -> Publish -> Unmerge pattern so vLLM receives dense weights
+        but training continues on adapters.
         """
-        # Only rank 0 talks to the runtime in distributed mode
-        if dist.is_available() and dist.is_initialized():
-            if dist.get_rank() != 0:
+        # Helper to get the underlying model if wrapped in FSDP
+        # FSDP wraps the actual model in .module
+        inner_model = self.model.module if isinstance(self.model, FSDP) else self.model
+
+        # 1. Check if this is a LoRA/PEFT model
+        #    (We use getattr so we don't need to import peft here)
+        merge_fn = getattr(inner_model, "merge_adapter", None)
+        unmerge_fn = getattr(inner_model, "unmerge_adapter", None)
+        is_peft = callable(merge_fn) and callable(unmerge_fn)
+
+        # 2. If LoRA, merge weights before gathering
+        if is_peft:
+            merge_fn()
+
+        try:
+            # Only rank 0 talks to the runtime in distributed mode
+            if dist.is_available() and dist.is_initialized():
+                if dist.get_rank() != 0:
+                    return
+
+            runtime_device = torch.device(
+                self.cfg.runtime_device or self.cfg.model_device
+            )
+
+            # --- Helpers to clean/filter keys for vLLM ---
+            def should_publish(k: str) -> bool:
+                # Filter out pure adapter weights (lora_A, lora_B, etc.)
+                # vLLM (dense mode) won't recognize them.
+                if "lora_" in k or "lora." in k:
+                    return False
+                return True
+
+            def clean_name(k: str) -> str:
+                # Strip the PEFT prefix so vLLM sees standard keys
+                # base_model.model.model.layers... -> model.layers...
+                return k.replace("base_model.model.", "")
+            # ---------------------------------------------
+
+            # ---------------- FSDP path ----------------
+            if isinstance(self.model, FSDP):
+                # Gather full, unsharded state dict on the model device.
+                full_cfg = FullStateDictConfig(
+                    offload_to_cpu=False,  # full model stays on GPU; rollouts dominate anyway
+                    rank0_only=True,
+                )
+                with FSDP.state_dict_type(
+                    self.model,
+                    StateDictType.FULL_STATE_DICT,
+                    full_cfg,
+                ):
+                    full_state = self.model.state_dict()
+
+                params: Dict[str, Tensor] = {}
+                for name, tensor in full_state.items():
+                    if not should_publish(name):
+                        continue
+                    if self.param_filter is not None and not self.param_filter(name, tensor):
+                        continue
+                    
+                    # Clean key and move to device
+                    clean_k = clean_name(name)
+                    params[clean_k] = tensor.detach().to(runtime_device)
+
+                if not params:
+                    return
+
+                self.publisher.publish(params)
                 return
 
-        runtime_device = torch.device(
-            self.cfg.runtime_device or self.cfg.model_device
-        )
-
-        # ---------------- FSDP path ----------------
-        if isinstance(self.model, FSDP):
-            # Gather full, unsharded state dict on the model device.
-            full_cfg = FullStateDictConfig(
-                offload_to_cpu=False,  # full model stays on GPU; rollouts dominate anyway
-                rank0_only=True,
-            )
-            with FSDP.state_dict_type(
-                self.model,
-                StateDictType.FULL_STATE_DICT,
-                full_cfg,
-            ):
-                full_state = self.model.state_dict()
-
+            # ---------------- non-FSDP path ----------------
             params: Dict[str, Tensor] = {}
-            for name, tensor in full_state.items():
-                if self.param_filter is not None and not self.param_filter(name, tensor):
+            for name, p in self.model.named_parameters():
+                if not should_publish(name):
                     continue
-                # Important: The publisher handles the network transport,
-                # but we ensure tensors are on the correct device/detached first.
-                params[name] = tensor.detach().to(runtime_device)
+
+                if self.param_filter is not None:
+                    if not self.param_filter(name, p):
+                        continue
+                else:
+                    # In LoRA mode, non-adapter weights usually have requires_grad=False.
+                    # HOWEVER, because we just called merge_adapter(), the base weights
+                    # now theoretically contain the signal.
+                    # We publish everything that matches our requirements.
+
+                    # If standard training: send only requires_grad=True
+                    # If LoRA (merged): send everything (because base weights need updating in vLLM)
+                    if not is_peft and not p.requires_grad:
+                        continue
+
+                clean_k = clean_name(name)
+                params[clean_k] = p.detach().to(runtime_device)
 
             if not params:
                 return
 
             self.publisher.publish(params)
-            return
 
-        # ---------------- non-FSDP path ----------------
-        params: Dict[str, Tensor] = {}
-        for name, p in self.model.named_parameters():
-            if self.param_filter is not None:
-                if not self.param_filter(name, p):
-                    continue
-            else:
-                if not p.requires_grad:
-                    continue
-
-            params[name] = p.detach().to(runtime_device)
-
-        if not params:
-            return
-
-        self.publisher.publish(params)
+        finally:
+            # 3. CRITICAL: Unmerge adapters immediately after publishing.
+            #    If we don't do this, the optimizer state will become invalid
+            #    (gradients calculated on merged weights vs adapter weights).
+            if is_peft:
+                unmerge_fn()

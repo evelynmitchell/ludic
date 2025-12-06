@@ -16,14 +16,19 @@ class SingleAgentSyncProtocol(InteractionProtocol):
     It works perfectly with any env inheriting from SingleAgentEnv.
     """
     
-    def __init__(self, agent: Agent):
+    def __init__(self, agent: Agent, prompt: Optional[str] = None):
         """
-        Initializes the protocol with the single agent it will use.
+        Initializes the protocol.
         
         Args:
             agent: A fully-configured Agent instance.
+            prompt: An optional system prompt override. 
+                    If set, this takes priority over the environment's 
+                    suggested_sysprompt. This allows you to decouple 
+                    prompt engineering from environment logic.
         """
         self.agent = agent
+        self.prompt = prompt
 
     async def run(
         self,
@@ -53,7 +58,12 @@ class SingleAgentSyncProtocol(InteractionProtocol):
         obs, info = obs_info_dict[agent_id]
         
         # 3. --- Reset Agent & Feed First Obs ---
-        sys_prompt = getattr(env, "suggested_sysprompt", None)
+        # Protocol prompt takes priority over Env prompt
+        if self.prompt is not None:
+            sys_prompt = self.prompt
+        else:
+            sys_prompt = getattr(env, "suggested_sysprompt", None)
+
         agent.reset(system_prompt=sys_prompt)
         agent.on_env_reset(obs, info)
         
