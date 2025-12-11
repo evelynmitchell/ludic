@@ -15,10 +15,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import os
 import queue
-from collections import deque
 from typing import List, Dict, Any
 
 import torch
@@ -43,9 +41,7 @@ from ludic.training.config import TrainerConfig
 from ludic.training.checkpoint import CheckpointConfig
 from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
 from ludic.training.stats import Reducer
-from ludic.training.loggers import PrintLogger
-from rich.console import Console
-from rich.table import Table
+from ludic.training.loggers import RichLiveLogger
 
 
 def load_gsm8k(split: str, limit: int | None) -> List[Dict[str, Any]]:
@@ -246,6 +242,23 @@ def main():
         ),
     }
 
+    # Choose your logger: RichLiveLogger (with ASCII chart + metrics panel).
+    train_logger = RichLiveLogger(
+        keys=[
+            "loss",
+            "avg_total_reward",
+            "correct_rate",
+            "parse_err_rate",
+            "avg_completion_length",
+            "total_completion_tokens",
+            "num_rollouts",
+            "num_samples",
+        ],
+        spark_key="avg_total_reward",
+        history=100,
+        precision=4,
+    )
+
     trainer = Trainer(
         model=model,
         algo=algo,
@@ -253,31 +266,9 @@ def main():
         publisher=publisher,
         cfg=cfg,
         checkpoint_config=checkpoint_cfg,
-        train_logger=PrintLogger(prefix="[gsm8k]"),
+        train_logger=train_logger,
         reducers=reducers,
     )
-
-    console = Console()
-
-    def tail_rollouts(path: str, n: int = 5) -> list[dict[str, Any]]:
-        """
-        Read the last n valid JSONL entries (simple streaming tail). Robust to
-        partial/invalid lines; just skips them.
-        """
-        if not os.path.exists(path):
-            return []
-        buf: deque[dict[str, Any]] = deque(maxlen=n)
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                buf.append(obj)
-        return list(buf)
 
     async def train_loop():
         train_step = 0
@@ -298,42 +289,6 @@ def main():
                 break
             stats = await trainer.train_step()
             train_step = int(stats["train_step"])
-            print(
-                f"step={train_step} loss={stats.get('loss', 0):.4f} "
-                f"reward={stats.get('avg_total_reward', 0):.4f}"
-            )
-            if "avg_completion_length" in stats:
-                print(f"avg_completion_length={stats['avg_completion_length']:.2f}")
-
-            # Pretty-print a few recent rollouts from the JSONL log
-            rollouts = tail_rollouts(rollout_log_path, n=3)
-            if rollouts:
-                table = Table(title=f"Recent Rollouts (logged) @ step {train_step}", show_lines=False)
-                table.add_column("question_id", style="cyan", no_wrap=True, width=8)
-                table.add_column("question", style="white", max_width=60, overflow="fold")
-                table.add_column("raw_action", style="magenta", max_width=60, overflow="fold")
-                table.add_column("parsed", style="yellow", no_wrap=True)
-                table.add_column("target", style="green", no_wrap=True)
-                table.add_column("reward", style="bold", no_wrap=True)
-                table.add_column("correct", style="bold", no_wrap=True)
-                for r in rollouts:
-                    if not r.get("steps"):
-                        continue
-                    step = r["steps"][-1]
-                    info = step.get("info", {})
-                    table.add_row(
-                        str(info.get("question_id")),
-                        (step.get("prev_obs") or "")[:120],
-                        (step.get("action") or "")[:80],
-                        str(info.get("parsed_answer")),
-                        str(info.get("target_answer")),
-                        f"{step.get('reward')}",
-                        "✅" if info.get("correct") else "❌",
-                    )
-                console.print(table)
-            else:
-                console.print(f"[dim]No rollouts logged yet at {rollout_log_path}[/dim]")
-
             if args.eval_every > 0 and train_step % args.eval_every == 0 and eval_samples:
                 acc = await run_eval(
                     samples=eval_samples,
