@@ -244,6 +244,7 @@ class RolloutEngine:
         weights = credit_assigner.compute(rollouts)
 
         items: List[SAWItem] = []
+        completion_lengths: List[int] = []
 
         for r in rollouts:
             for step in r.steps:
@@ -276,6 +277,7 @@ class RolloutEngine:
                     input_ids = list(prompt_ids) + list(completion_ids)
                     attention_mask = [1] * len(input_ids)
                     action_mask = [0] * len(prompt_ids) + [1] * len(completion_ids)
+                    completion_lengths.append(len(completion_ids))
 
                     items.append(
                         SAWItem(
@@ -311,6 +313,7 @@ class RolloutEngine:
 
                 state_ids = tokenize(state_text)  # type: ignore[arg-type]
                 action_ids = tokenize(action_text)  # type: ignore[arg-type]
+                completion_lengths.append(len(action_ids))
 
                 input_ids = state_ids + action_ids
                 attention_mask = [1] * len(input_ids)
@@ -343,6 +346,10 @@ class RolloutEngine:
             "avg_total_reward": (
                 float(sum(r.total_reward for r in rollouts) / len(rollouts))
                 if rollouts else 0.0
+            ),
+            "avg_completion_length": (
+                float(sum(completion_lengths) / len(completion_lengths))
+                if completion_lengths else 0.0
             ),
         }
 

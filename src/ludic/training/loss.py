@@ -37,11 +37,13 @@ def selective_log_softmax(logits: Tensor, index: Tensor) -> Tensor:
 def compute_logp_action(
     logits: Tensor, 
     input_ids: Tensor, 
-    action_mask: Tensor
+    action_mask: Tensor,
+    *,
+    length_normalize: bool = False,
 ) -> Tensor:
     """
     Compute log π(a|s) given token-level logits and an action mask.
-    
+
     Args:
         logits: [B, T, V] float tensor of unnormalized logits.
         input_ids: [B, T] long tensor of token ids actually sampled.
@@ -56,12 +58,23 @@ def compute_logp_action(
     if input_ids.shape != logits.shape[:2]:
         raise ValueError(f"Shape mismatch: input_ids {input_ids.shape} vs logits {logits.shape}")
 
-    # Use the compiled fused kernel
-    token_logp = selective_log_softmax(logits, input_ids)
+    # Shift for causal LM: logits[t] predicts input_ids[t+1]
+    if logits.size(1) < 2:
+        raise ValueError("Sequence too short to compute next-token logprobs.")
+    logits_shifted = logits[:, :-1, :]          # [B, T-1, V]
+    target_ids = input_ids[:, 1:]               # [B, T-1]
+    action_mask_shifted = action_mask[:, 1:]    # [B, T-1]
+
+    # Use the compiled fused kernel on aligned targets
+    token_logp = selective_log_softmax(logits_shifted, target_ids)
 
     # Sum log-probs over the action region only: [B]
-    amask = action_mask.to(token_logp.dtype)
+    amask = action_mask_shifted.to(token_logp.dtype)
     logp_action = (token_logp * amask).sum(dim=-1)
+
+    if length_normalize:
+        lengths = amask.sum(dim=-1).clamp(min=1.0)
+        logp_action = logp_action / lengths
 
     return logp_action
 
@@ -80,13 +93,16 @@ class ReinforceLoss:
 
     where A is taken from `batch["weight"]`.
     """
+    length_normalize: bool = False
 
     def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
         input_ids = batch["input_ids"]            # [B, T]
         action_mask = batch["action_mask"]        # [B, T]
         advantages = batch["weight"]              # [B]
 
-        logp_action = compute_logp_action(logits, input_ids, action_mask)  # [B]
+        logp_action = compute_logp_action(
+            logits, input_ids, action_mask, length_normalize=self.length_normalize
+        )  # [B]
 
         loss = - (advantages * logp_action).mean()
 
@@ -111,13 +127,16 @@ class ReinforceBaselineLoss:
     """
 
     normalize: bool = False
+    length_normalize: bool = False
 
     def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
         input_ids = batch["input_ids"]
         action_mask = batch["action_mask"]
         adv_raw = batch["weight"]                # [B]
 
-        logp_action = compute_logp_action(logits, input_ids, action_mask)  # [B]
+        logp_action = compute_logp_action(
+            logits, input_ids, action_mask, length_normalize=self.length_normalize
+        )  # [B]
 
         baseline = adv_raw.mean()
         advantages = adv_raw - baseline

@@ -8,7 +8,7 @@ from ludic.context.full_dialog import FullDialog
 from ludic.inference.client import ChatClient, ChatResponse
 from ludic.inference.sampling import SamplingConfig
 from ludic.types import Message
-from ludic.parsers import xml_move_parser, ParseResult
+from ludic.parsers import xml_move_parser
 
 # ---------------------------------------------------------------------
 # Mocks & Helpers

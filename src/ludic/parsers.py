@@ -117,3 +117,31 @@ def xml_move_parser(raw: str) -> ParseResult:
             reward=-1.0,
             obs=f"Invalid action format: {e}",
         )
+
+
+# ---------------------------------------------------------------------
+# Strict \boxed{...} answer parser
+# ---------------------------------------------------------------------
+
+def boxed_parser(raw: str) -> ParseResult:
+    """
+    STRICT parser that requires the final answer to appear inside \\boxed{...}.
+    """
+    try:
+        m = re.search(r"\\boxed\{([^}]*)\}", raw, flags=re.DOTALL)
+        if not m:
+            raise ValueError("Expected \\boxed{...} with the final answer.")
+
+        inner = m.group(1).strip()
+        if not inner:
+            raise ValueError("Empty \\boxed{} content.")
+
+        # Positive intrinsic reward for good formatting
+        return ParseResult(action=inner, reward=0.1, obs=None)
+
+    except Exception as e:
+        return ParseResult(
+            action=None,
+            reward=-1.0,
+            obs=f"Invalid boxed answer: {e}",
+        )

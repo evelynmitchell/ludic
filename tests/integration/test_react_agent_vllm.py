@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 from transformers import AutoTokenizer  # Only for verification
-from typing import Tuple
 
 from ludic.inference.vllm_client import VLLMChatClient
 from ludic.agents.react_agent import ReActAgent

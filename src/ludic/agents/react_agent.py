@@ -39,7 +39,7 @@ class ReActAgent(Agent):
         
         # Safety check: Context must explicitly flag support for tools
         if not self._ctx.supports_tools:
-            raise TypeError(f"ReActAgent requires a context with supports_tools=True. ")
+            raise TypeError("ReActAgent requires a context with supports_tools=True. ")
 
     async def act(
         self, 

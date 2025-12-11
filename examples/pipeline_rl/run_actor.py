@@ -1,6 +1,5 @@
 import logging
 import asyncio
-import time
 
 # Ludic Imports
 from ludic.agents.base_agent import Agent
@@ -71,7 +70,7 @@ def make_requests() -> list[RolloutRequest]:
     )]
 
 async def main():
-    print(f"🎬 Starting ACTOR Node")
+    print("🎬 Starting ACTOR Node")
     print(f"   vLLM:  {VLLM_HOST}:{VLLM_PORT}")
     print(f"   Redis: {REDIS_URL}")
     
