@@ -59,7 +59,12 @@ def compose_parsers(*parsers: Parser) -> Parser:
 # Strict CoT <think>...</think> prefix parser
 # ---------------------------------------------------------------------
 
-def cot_prefix_parser(raw: str) -> ParseResult:
+def cot_prefix_parser(
+    raw: str,
+    *,
+    success_reward: float = 0.1,
+    error_reward: float = -1.0,
+) -> ParseResult:
     """
     STRICT CoT prefix parser.
 
@@ -68,6 +73,10 @@ def cot_prefix_parser(raw: str) -> ParseResult:
 
     Output:
         action = ANSWER
+
+    Rewards:
+        Defaults to +0.1 on success and -1.0 on failure; override via keyword
+        args or functools.partial for custom parser instances.
     """
     try:
         pattern = re.compile(
@@ -82,12 +91,12 @@ def cot_prefix_parser(raw: str) -> ParseResult:
         if not answer:
             raise ValueError("Missing answer after </think>.")
 
-        return ParseResult(action=answer, reward=0.0, obs=None)
+        return ParseResult(action=answer, reward=success_reward, obs=None)
 
     except Exception as e:
         return ParseResult(
             action=None,
-            reward=-1.0,
+            reward=error_reward,
             obs=f"Invalid CoT structure: {e}",
         )
 
@@ -96,9 +105,18 @@ def cot_prefix_parser(raw: str) -> ParseResult:
 # Strict XML <move>...</move> parser
 # ---------------------------------------------------------------------
 
-def xml_move_parser(raw: str) -> ParseResult:
+def xml_move_parser(
+    raw: str,
+    *,
+    success_reward: float = 0.1,
+    error_reward: float = -1.0,
+) -> ParseResult:
     """
     STRICT parser for <move>...</move>.
+
+    Rewards:
+        Defaults to +0.1 on success and -1.0 on failure; override via keyword
+        args or functools.partial for custom parser instances.
     """
     try:
         m = re.search(r"<move>(.*?)</move>", raw, flags=re.DOTALL | re.IGNORECASE)
@@ -109,12 +127,12 @@ def xml_move_parser(raw: str) -> ParseResult:
         if not inner:
             raise ValueError("Empty <move> tag.")
 
-        return ParseResult(action=inner, reward=0.0, obs=None)
+        return ParseResult(action=inner, reward=success_reward, obs=None)
 
     except Exception as e:
         return ParseResult(
             action=None,
-            reward=-1.0,
+            reward=error_reward,
             obs=f"Invalid action format: {e}",
         )
 
@@ -123,9 +141,18 @@ def xml_move_parser(raw: str) -> ParseResult:
 # Strict \boxed{...} answer parser
 # ---------------------------------------------------------------------
 
-def boxed_parser(raw: str) -> ParseResult:
+def boxed_parser(
+    raw: str,
+    *,
+    success_reward: float = 0.1,
+    error_reward: float = -1.0,
+) -> ParseResult:
     """
     STRICT parser that requires the final answer to appear inside \\boxed{...}.
+
+    Rewards:
+        Defaults to +0.1 on success and -1.0 on failure; override via keyword
+        args or functools.partial for custom parser instances.
     """
     try:
         m = re.search(r"\\boxed\{([^}]*)\}", raw, flags=re.DOTALL)
@@ -137,11 +164,11 @@ def boxed_parser(raw: str) -> ParseResult:
             raise ValueError("Empty \\boxed{} content.")
 
         # Positive intrinsic reward for good formatting
-        return ParseResult(action=inner, reward=0.1, obs=None)
+        return ParseResult(action=inner, reward=success_reward, obs=None)
 
     except Exception as e:
         return ParseResult(
             action=None,
-            reward=-1.0,
+            reward=error_reward,
             obs=f"Invalid boxed answer: {e}",
         )

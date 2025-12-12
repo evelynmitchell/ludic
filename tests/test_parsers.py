@@ -1,3 +1,5 @@
+from functools import partial
+
 import pytest
 
 from ludic.parsers import (
@@ -18,7 +20,7 @@ def test_cot_prefix_parser_success():
 
     assert isinstance(r, ParseResult)
     assert r.action == "ANSWER"
-    assert r.reward == 0.0
+    assert r.reward == pytest.approx(0.1)
     assert r.obs is None
 
 
@@ -33,7 +35,7 @@ def test_cot_prefix_parser_allows_whitespace_newlines():
     r = cot_prefix_parser(raw)
 
     assert r.action == "Final answer here"
-    assert r.reward == 0.0
+    assert r.reward == pytest.approx(0.1)
     assert r.obs is None
 
 
@@ -55,6 +57,16 @@ def test_cot_prefix_parser_fails_on_empty_answer():
     assert "Missing answer" in r.obs
 
 
+def test_cot_prefix_parser_custom_rewards():
+    parser = partial(cot_prefix_parser, success_reward=0.25, error_reward=-0.25)
+
+    success = parser("<think>foo</think> bar")
+    assert success.reward == pytest.approx(0.25)
+
+    failure = parser("invalid format")
+    assert failure.reward == pytest.approx(-0.25)
+
+
 # ---------------------------------------------------------------------
 # xml_move_parser tests
 # ---------------------------------------------------------------------
@@ -64,7 +76,7 @@ def test_xml_move_parser_success():
     r = xml_move_parser(raw)
 
     assert r.action == "A1"
-    assert r.reward == 0.0
+    assert r.reward == pytest.approx(0.1)
     assert r.obs is None
 
 
@@ -73,7 +85,7 @@ def test_xml_move_parser_is_case_insensitive():
     r = xml_move_parser(raw)
 
     assert r.action == "b3"
-    assert r.reward == 0.0
+    assert r.reward == pytest.approx(0.1)
 
 
 def test_xml_move_parser_fails_without_move_tag():
@@ -94,6 +106,14 @@ def test_xml_move_parser_fails_on_empty_move():
     assert "Empty" in r.obs or "empty" in r.obs
 
 
+def test_xml_move_parser_custom_penalty():
+    parser = partial(xml_move_parser, error_reward=-0.5)
+    r = parser("bad move format")
+
+    assert r.action is None
+    assert r.reward == pytest.approx(-0.5)
+
+
 # ---------------------------------------------------------------------
 # compose_parsers tests
 # ---------------------------------------------------------------------
@@ -105,7 +125,7 @@ def test_compose_parsers_success_chain():
     r = parser(raw)
 
     assert r.action == "C2"
-    assert r.reward == 0.0
+    assert r.reward == pytest.approx(0.2)
     assert r.obs is None
 
 
