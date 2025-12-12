@@ -20,6 +20,10 @@ class ToolAgent(Agent):
       - SamplingArgs augmentation to advertise tools to the model.
       - Execution + recording of tool calls into the ContextStrategy.
       - Extraction of content/tool_calls from OpenAI raw_response info.
+
+    Tool errors:
+      - Missing tools, invalid JSON arguments, and tool exceptions are
+        caught and recorded as tool messages in the ContextStrategy.
     """
 
     def __init__(self, tools: Sequence[Callable], **kwargs):
@@ -118,4 +122,3 @@ class ToolAgent(Agent):
                 },
             },
         }
-

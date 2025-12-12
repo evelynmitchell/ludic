@@ -14,6 +14,14 @@ class SingleAgentSyncProtocol(InteractionProtocol):
     one agent and that this agent is active every step.
     
     It works perfectly with any env inheriting from SingleAgentEnv.
+
+    Parser failures:
+      If the agent's parser returns ParseResult.action=None, the protocol
+      does not call env.step(). Instead it logs a synthetic Step with
+      reward=parse_result.reward, next_obs=parse_result.obs (or
+      "Invalid action."), and info including parse_error=True. The
+      synthetic observation is fed back into the agent context for the
+      next turn.
     """
     
     def __init__(self, agent: Agent, prompt: Optional[str] = None):

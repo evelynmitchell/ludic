@@ -17,6 +17,13 @@ class MultiAgentProtocol(InteractionProtocol):
     
     It returns a list of Rollouts (one per managed agent) suitable
     for training.
+
+    Parser failures:
+      If a managed agent's parser returns ParseResult.action=None, that
+      agent is omitted from env.step(actions). A synthetic Step is still
+      logged for the failing agent (reward=parse_result.reward, info
+      includes parse_error=True). The failing agent's context is updated
+      with the synthetic observation for the next turn.
     """
     
     def __init__(self, agents: Dict[str, Agent]):
