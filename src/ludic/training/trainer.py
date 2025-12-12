@@ -9,10 +9,10 @@ from typing import Callable, Dict, List, Optional, Mapping
 import torch
 from torch import nn, optim, Tensor
 import torch.distributed as dist
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    StateDictType,
-    FullStateDictConfig,
+from torch.distributed import fsdp
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict,
+    StateDictOptions,
 )
 
 from ludic.distributed.interfaces import PolicyPublisher
@@ -102,7 +102,7 @@ class Trainer:
               ↓
             RLAlgorithm.compute_loss(model, batch)
               ↓
-            scaled_loss.backward() (with FSDP.no_sync())
+            scaled_loss.backward() (with gradient sync disabled on non-final micros for FSDP)
           ↓
         optimizer.step()
           ↓
@@ -112,13 +112,12 @@ class Trainer:
 
     Trainer is agnostic to envs, contexts, rollouts, and tokenization.
 
-    This variant is FSDP-aware:
+    This variant is FSDP2-aware:
 
-      - If `model` is wrapped in FSDP, it will:
-          * on rank 0 only:
-                - switch to FULL_STATE_DICT
-                - gather a full state dict (no CPU offload by default)
-                - push the full (unsharded) params to the runtime
+      - If `model` is wrapped in FSDP2 (fully_shard), it will:
+          * disable gradient sync on non-final micro-batches
+          * gather a full state dict on rank 0 via DCP APIs
+          * push the full (unsharded) params to the runtime
 
       - On non-FSDP models, it just uses `named_parameters()` as before.
     """
@@ -196,7 +195,7 @@ class Trainer:
 
         # Assume caller has already done any FSDP wrapping / device placement.
         # We do NOT unconditionally .to(device) for FSDP; that’s the caller’s job.
-        self.model = model.to(cfg.model_device) if not isinstance(model, FSDP) else model  # type: ignore[arg-type]
+        self.model = model.to(cfg.model_device) if not isinstance(model, fsdp.FSDPModule) else model  # type: ignore[arg-type]
 
         self.algo = algo
         self.publisher = publisher
@@ -284,6 +283,127 @@ class Trainer:
             eps=self.cfg.eps,
         )
 
+    def _maybe_reduce_stats_across_ranks(
+        self,
+        stats: Dict[str, float],
+        *,
+        device: torch.device,
+    ) -> Dict[str, float]:
+        if not self.cfg.reduce_stats_across_ranks:
+            return stats
+        if not (dist.is_available() and dist.is_initialized()):
+            return stats
+
+        world_size = dist.get_world_size()
+        sum_keys = {
+            "num_samples",
+            "num_rollouts",
+            "total_completion_tokens",
+        }
+        reduced: Dict[str, float] = {}
+
+        for k, v in stats.items():
+            if not isinstance(v, (int, float)):
+                continue
+            t = torch.tensor(float(v), device=device, dtype=torch.float32)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            if k in sum_keys:
+                reduced[k] = float(t.item())
+            else:
+                reduced[k] = float(t.item()) / float(world_size)
+
+        # Preserve the local step counter
+        reduced["train_step"] = float(self._train_step_idx)
+        return reduced
+
+    # ------------------------------------------------------------------
+    # Memory utilities (GPU-only)
+    # ------------------------------------------------------------------
+
+    def _reset_peak_memory(self, device: torch.device) -> Optional[int]:
+        """
+        Reset CUDA peak stats and return current allocated bytes.
+        """
+        if device.type != "cuda" or not torch.cuda.is_available():
+            return None
+        torch.cuda.reset_peak_memory_stats(device)
+        return torch.cuda.memory_allocated(device)
+
+    def _capture_forward_memory_stats(
+        self,
+        device: torch.device,
+        pre_forward_alloc: Optional[int],
+    ) -> tuple[Dict[str, float], Optional[int], Optional[int]]:
+        """
+        Capture forward-pass peak memory and activation peak.
+
+        Returns: (stats_dict, alloc_after_forward_bytes, forward_peak_bytes)
+        """
+        if device.type != "cuda" or not torch.cuda.is_available():
+            return {}, None, None
+
+        torch.cuda.synchronize(device)
+        mb = 1024 ** 2
+
+        forward_peak = torch.cuda.max_memory_allocated(device)
+        forward_activation_peak = max(0, forward_peak - (pre_forward_alloc or 0))
+        alloc_after_forward = torch.cuda.memory_allocated(device)
+
+        stats = {
+            "gpu_forward_peak_mb": forward_peak / mb,
+            "gpu_forward_activation_peak_mb": forward_activation_peak / mb,
+        }
+
+        logger.info(
+            "GPU forward memory (MB) peak/activation_peak: %.1f / %.1f",
+            stats["gpu_forward_peak_mb"],
+            stats["gpu_forward_activation_peak_mb"],
+        )
+
+        # Reset for backward measurement
+        torch.cuda.reset_peak_memory_stats(device)
+
+        return stats, alloc_after_forward, forward_peak
+
+    def _collect_memory_stats(
+        self,
+        device: torch.device,
+        *,
+        baseline_alloc: Optional[int],
+    ) -> tuple[Dict[str, float], Optional[int]]:
+        """
+        Capture current/peak GPU memory and backward activation footprint.
+
+        Returns: (stats_dict, peak_bytes)
+        """
+        if device.type != "cuda" or not torch.cuda.is_available():
+            return {}, None
+
+        torch.cuda.synchronize(device)
+        mb = 1024 ** 2
+
+        alloc = torch.cuda.memory_allocated(device)
+        reserved = torch.cuda.memory_reserved(device)
+        peak = torch.cuda.max_memory_allocated(device)
+        backward_activation_peak = max(0, peak - (baseline_alloc or 0))
+
+        stats = {
+            "gpu_mem_alloc_mb": alloc / mb,
+            "gpu_mem_reserved_mb": reserved / mb,
+            "gpu_backward_peak_mb": peak / mb,
+            "gpu_backward_activation_peak_mb": backward_activation_peak / mb,
+        }
+
+        logger.info(
+            "GPU backward memory (MB) alloc/reserved/peak/activation_peak: %.1f / %.1f / %.1f / %.1f",
+            stats["gpu_mem_alloc_mb"],
+            stats["gpu_mem_reserved_mb"],
+            stats["gpu_backward_peak_mb"],
+            stats["gpu_backward_activation_peak_mb"],
+        )
+
+        return stats, peak
+
     # ------------------------------------------------------------------
     # Core async train step (now a "macro-step")
     # ------------------------------------------------------------------
@@ -367,36 +487,61 @@ class Trainer:
                 f"(Batch={input_shape[0]}, SeqLen={input_shape[1]})"
             )
 
-            # ---- 1c) FSDP: context for no_sync -------------------------
+            # ---- 1c) FSDP2 gradient sync control ----------------------
             # We only sync (all-reduce) gradients on the *last* micro-batch
             is_last_micro = (micro_step_idx == grad_accum_steps - 1)
-            no_sync_context = (
-                self.model.no_sync()
-                if (isinstance(self.model, FSDP) and not is_last_micro)
-                else contextlib.nullcontext()
-            )
+            grad_sync_disabled = False
+            if isinstance(self.model, fsdp.FSDPModule) and not is_last_micro:
+                self.model.set_requires_gradient_sync(False)
+                grad_sync_disabled = True
 
             # ---- 1d) Loss + backward (scaled) --------------------------
-            with no_sync_context:
+            pre_forward_alloc = self._reset_peak_memory(device)
+            try:
                 loss, stats = self.algo.compute_loss(self.model, batch_tensors)
 
                 # Scale loss for accumulation
                 scaled_loss = loss / grad_accum_steps
+                # Forward memory stats before backward frees activations
+                forward_mem_stats, alloc_after_forward, forward_peak = (
+                    self._capture_forward_memory_stats(device, pre_forward_alloc)
+                )
+
                 scaled_loss.backward()
+            finally:
+                if grad_sync_disabled and isinstance(self.model, fsdp.FSDPModule):
+                    self.model.set_requires_gradient_sync(True)
+
+            # Attach memory stats (if available) for logging/aggregation
+            stats = dict(stats)
+            backward_mem_stats, backward_peak = self._collect_memory_stats(
+                device,
+                baseline_alloc=alloc_after_forward,
+            )
+
+            # Compute overall peak/activation across forward+backward
+            if forward_peak is not None or backward_peak is not None:
+                mb = 1024 ** 2
+                total_peak = max(
+                    forward_peak or 0,
+                    backward_peak or 0,
+                )
+                activation_total_peak = max(0, total_peak - (pre_forward_alloc or 0))
+
+                stats["gpu_mem_peak_mb"] = total_peak / mb
+                stats["gpu_activation_peak_mb"] = activation_total_peak / mb
+
+            stats.update(forward_mem_stats)
+            stats.update(backward_mem_stats)
 
             all_micro_stats.append(stats)
 
         # ---- 2) Gradient Clipping (after loop) -------------------------
         if self.cfg.max_grad_norm is not None:
-            # FSDP requires calling clip_grad_norm_ *on the model*
-            # to handle unsharding grads before clipping.
-            if isinstance(self.model, FSDP):
-                self.model.clip_grad_norm_(self.cfg.max_grad_norm)
-            else:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.cfg.max_grad_norm,
-                )
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.cfg.max_grad_norm,
+            )
 
         # ---- 3) Optimizer Step (one step for the macro-batch) ----------
         self.optimizer.step()
@@ -414,6 +559,8 @@ class Trainer:
         # ---- 6) Enrich stats -------------------------------------------
         final_stats = aggregate_stats(all_micro_stats, all_saw_batches, reducers=self.reducers)
         final_stats["train_step"] = float(self._train_step_idx)
+
+        final_stats = self._maybe_reduce_stats_across_ranks(final_stats, device=device)
 
         # ---- 7) Optional Checkpoint ------------------------------------
         if self._checkpointer is not None:
@@ -495,9 +642,8 @@ class Trainer:
         Merge -> Publish -> Unmerge pattern so vLLM receives dense weights
         but training continues on adapters.
         """
-        # Helper to get the underlying model if wrapped in FSDP
-        # FSDP wraps the actual model in .module
-        inner_model = self.model.module if isinstance(self.model, FSDP) else self.model
+        # Helper to get the underlying model if wrapped in FSDP2
+        inner_model = self.model
 
         # 1. Check if this is a LoRA/PEFT model
         #    (We use getattr so we don't need to import peft here)
@@ -510,10 +656,10 @@ class Trainer:
             merge_fn()
 
         try:
-            # Only rank 0 talks to the runtime in distributed mode
-            if dist.is_available() and dist.is_initialized():
-                if dist.get_rank() != 0:
-                    return
+            rank = 0
+            is_distributed = dist.is_available() and dist.is_initialized()
+            if is_distributed:
+                rank = dist.get_rank()
 
             runtime_device = torch.device(
                 self.cfg.runtime_device or self.cfg.model_device
@@ -524,24 +670,29 @@ class Trainer:
 
             raw_params: Dict[str, Tensor] = {}
 
-            # --- Gather Raw Params (FSDP or Standard) ---
-            if isinstance(self.model, FSDP):
-                # Gather full, unsharded state dict on the model device.
-                full_cfg = FullStateDictConfig(
-                    offload_to_cpu=False,  # full model stays on GPU; rollouts dominate anyway
-                    rank0_only=True,
+            # --- Gather Raw Params (FSDP2 or Standard) ---
+            if isinstance(self.model, fsdp.FSDPModule):
+                # DCP full_state_dict gathering is collective; all ranks must participate.
+                # Use cpu_offload=True to avoid materializing a full copy on every rank.
+                options = StateDictOptions(
+                    full_state_dict=True,
+                    cpu_offload=True,
                 )
-                with FSDP.state_dict_type(
-                    self.model,
-                    StateDictType.FULL_STATE_DICT,
-                    full_cfg,
-                ):
-                    full_state = self.model.state_dict()
-                    for k, v in full_state.items():
-                        if self.param_filter is not None and not self.param_filter(k, v):
-                            continue
-                        raw_params[k] = v.detach().to(runtime_device)
+                full_state = get_model_state_dict(
+                    model=self.model,
+                    options=options,
+                )
+                if is_distributed and rank != 0:
+                    return
+                for k, v in full_state.items():
+                    if self.param_filter is not None and not self.param_filter(k, v):
+                        continue
+                    raw_params[k] = v.detach().to(runtime_device)
             else:
+                # Only rank 0 talks to the runtime in distributed mode
+                if is_distributed and rank != 0:
+                    return
+
                 # Standard model
                 for name, p in self.model.named_parameters():
                     # Optimization: In LoRA, only send what we touched (plus what needs fusion)
