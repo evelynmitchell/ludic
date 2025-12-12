@@ -6,7 +6,7 @@ from transformers import AutoTokenizer  # Only for verification
 from ludic.inference.vllm_client import VLLMChatClient
 from ludic.agents.react_agent import ReActAgent
 from ludic.context.full_dialog import FullDialog
-from ludic.parsers import ParseResult
+from tests._mocks import _mock_parser
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -41,15 +41,11 @@ async def test_react_agent_vllm_tool_call_loop(
     4. Agent must: Think -> Call Tool -> See 'BLUE-42' -> Output Final Answer.
     """
     
-    # 1. Setup the Agent
-    def simple_parser(text: str) -> ParseResult:
-        return ParseResult(action=text, reward=0.0, obs=None)
-
     agent = ReActAgent(
         client=vllm_client,
         model=vllm_model_name,
         ctx=FullDialog(),
-        parser=simple_parser,
+        parser=_mock_parser,
         tools=[get_secret_code],
         max_react_steps=3
     )

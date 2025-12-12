@@ -19,6 +19,12 @@ def _mock_parser(raw: str) -> ParseResult:
     """A simple parser that just passes the text through."""
     return ParseResult(action=raw, reward=0.0, obs=None)
 
+# ---- Common test tools --------------------------------------------------
+
+def calculator_tool(a: int, b: int) -> int:
+    """Adds two numbers."""
+    return a + b
+
 # ---- Mock client ---------------------------------------------------------
 
 class MockClient(ChatClient):

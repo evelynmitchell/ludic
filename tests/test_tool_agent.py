@@ -9,12 +9,9 @@ from ludic.agents.tool_agent import ToolAgent
 from ludic.context.full_dialog import FullDialog
 from ludic.inference.client import ChatClient, ChatResponse
 from ludic.inference.sampling import SamplingConfig
-from ludic.parsers import ParseResult
 from ludic.types import Message
 
-
-def _passthrough_parser(raw: str) -> ParseResult:
-    return ParseResult(action=raw, reward=0.0, obs=None)
+from tests._mocks import _mock_parser, calculator_tool
 
 
 class DummyClient(ChatClient):
@@ -30,12 +27,6 @@ class DummyClient(ChatClient):
     def sync_weights(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         raise NotImplementedError
 
-
-def calculator_tool(a: int, b: int) -> int:
-    """Adds two numbers."""
-    return a + b
-
-
 @pytest.mark.asyncio
 async def test_tool_agent_helpers_and_execution():
     ctx = FullDialog()
@@ -43,7 +34,7 @@ async def test_tool_agent_helpers_and_execution():
         client=DummyClient(),
         model="mock",
         ctx=ctx,
-        parser=_passthrough_parser,
+        parser=_mock_parser,
         tools=[calculator_tool],
     )
 
@@ -87,4 +78,3 @@ async def test_tool_agent_helpers_and_execution():
     assert ctx.messages[-1]["role"] == "tool"
     assert ctx.messages[-1]["content"] == "5"
     assert ctx.messages[-1]["tool_call_id"] == "call_1"
-

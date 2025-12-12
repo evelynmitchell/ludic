@@ -7,6 +7,7 @@ from ludic.interaction.multi_agent import MultiAgentProtocol
 from ludic.agents.base_agent import Agent
 from ludic.inference.client import ChatResponse
 from ludic.parsers import (
+    ParseResult,
     cot_prefix_parser,
     xml_move_parser,
     compose_parsers,
@@ -280,3 +281,177 @@ async def test_multi_agent_handles_unmanaged_bot_turns():
     assert step.action == "Hero Attack"
     assert step.reward == 10.0
     assert step.terminated is True
+
+
+# ---------------------------------------------------------------------
+# Parser failure handling (protocols)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_single_agent_protocol_logs_parser_failure_without_env_step():
+    """
+    If the agent parser fails, SingleAgentSyncProtocol should:
+      - NOT call env.step()
+      - log a synthetic step with parse_error info
+      - feed the synthetic observation back to the agent context
+    """
+
+    class CountingEnv(MockEnv):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.step_calls = 0
+
+        def env_step(self, action: str) -> StepOutcome:  # type: ignore[override]
+            self.step_calls += 1
+            return super().env_step(action)
+
+    def always_fail_parser(_: str) -> ParseResult:
+        return ParseResult(action=None, reward=-0.5, obs="bad action")
+
+    env = CountingEnv(max_steps=3, target="1")
+    agent = Agent(
+        client=MockClient(text="BADRAW"),
+        model="mock",
+        ctx=FullDialog(),
+        parser=always_fail_parser,
+    )
+    protocol = SingleAgentSyncProtocol(agent=agent)
+
+    rollouts = await protocol.run(env=env, max_steps=1, sampling_args={})
+
+    assert env.step_calls == 0
+    assert len(rollouts) == 1
+    r = rollouts[0]
+    assert len(r.steps) == 1
+
+    step = r.steps[0]
+    assert step.action == "BADRAW"
+    assert step.next_obs == "bad action"
+    assert step.reward == pytest.approx(-0.5)
+    assert step.info.get("parse_error") is True
+    assert step.terminated is False
+    assert step.truncated is False
+
+    # Synthetic obs should be appended to agent context as user message.
+    assert agent._ctx.messages[-1]["role"] == "user"
+    assert agent._ctx.messages[-1]["content"] == "bad action"
+
+
+@pytest.mark.asyncio
+async def test_multi_agent_protocol_excludes_parse_fail_actions_and_logs_synthetic_step():
+    """
+    MultiAgentProtocol should omit invalid parsed actions from env.step(),
+    but still log a synthetic step and update context for the failing agent.
+    """
+
+    class SimulEnv(LudicEnv[str, str, str]):
+        def __init__(self) -> None:
+            self._agents = ["A", "B"]
+            self.last_actions: Dict[str, str] | None = None
+            self._done = False
+
+        @property
+        def agent_ids(self) -> List[str]:
+            return list(self._agents)
+
+        @property
+        def active_agents(self) -> List[str]:
+            return [] if self._done else list(self._agents)
+
+        def reset(self, *, seed: Optional[int] = None) -> Dict[str, Tuple[str, Info]]:
+            self._done = False
+            return {"A": ("obsA", {}), "B": ("obsB", {})}
+
+        def step(self, actions: Dict[str, str]) -> Dict[str, StepOutcome]:
+            self.last_actions = dict(actions)
+            assert "B" not in actions, "Parse-fail agent should not be sent to env.step"
+            assert actions.get("A") == "GOOD"
+            self._done = True
+            return {
+                "A": StepOutcome(obs="doneA", reward=1.0, truncated=False, terminated=True, info={}),
+                "B": StepOutcome(obs="doneB", reward=0.0, truncated=False, terminated=True, info={}),
+            }
+
+    def always_fail_parser(_: str) -> ParseResult:
+        return ParseResult(action=None, reward=-0.7, obs="bad action")
+
+    env = SimulEnv()
+    good_agent = MockAgent(client=MockClient(text="GOOD"))
+    bad_agent = MockAgent(client=MockClient(text="BADRAW"), parser=always_fail_parser)
+
+    protocol = MultiAgentProtocol(agents={"A": good_agent, "B": bad_agent})
+    rollouts = await protocol.run(env=env, max_steps=3, sampling_args={})
+
+    assert env.last_actions == {"A": "GOOD"}
+    assert len(rollouts) == 2
+
+    r_a = next(r for r in rollouts if r.meta["agent_id"] == "A")
+    r_b = next(r for r in rollouts if r.meta["agent_id"] == "B")
+
+    assert len(r_a.steps) == 1
+    assert r_a.steps[0].reward == pytest.approx(1.0)
+
+    assert len(r_b.steps) == 1
+    step_b = r_b.steps[0]
+    assert step_b.action == "BADRAW"
+    assert step_b.next_obs == "bad action"
+    assert step_b.reward == pytest.approx(-0.7)
+    assert step_b.info.get("parse_error") is True
+    assert step_b.terminated is False
+
+
+@pytest.mark.asyncio
+async def test_multi_agent_protocol_all_parse_fail_does_not_step_env():
+    """
+    Regression test: if *all* active managed agents fail parsing in a turn,
+    MultiAgentProtocol should NOT call env.step({}).
+    """
+
+    class StrictSimulEnv(LudicEnv[str, str, str]):
+        def __init__(self) -> None:
+            self._agents = ["A", "B"]
+            self.step_calls = 0
+
+        @property
+        def agent_ids(self) -> List[str]:
+            return list(self._agents)
+
+        @property
+        def active_agents(self) -> List[str]:
+            return list(self._agents)
+
+        def reset(self, *, seed: Optional[int] = None) -> Dict[str, Tuple[str, Info]]:
+            return {"A": ("obsA", {}), "B": ("obsB", {})}
+
+        def step(self, actions: Dict[str, str]) -> Dict[str, StepOutcome]:
+            self.step_calls += 1
+            raise AssertionError("env.step should not be called when all actions are invalid")
+
+    def always_fail_parser(_: str) -> ParseResult:
+        return ParseResult(action=None, reward=-0.3, obs="bad action")
+
+    env = StrictSimulEnv()
+    agent_a = MockAgent(client=MockClient(text="RAW_A"), parser=always_fail_parser)
+    agent_b = MockAgent(client=MockClient(text="RAW_B"), parser=always_fail_parser)
+
+    protocol = MultiAgentProtocol(agents={"A": agent_a, "B": agent_b})
+    rollouts = await protocol.run(env=env, max_steps=1, sampling_args={})
+
+    assert env.step_calls == 0
+    assert len(rollouts) == 2
+
+    r_a = next(r for r in rollouts if r.meta["agent_id"] == "A")
+    r_b = next(r for r in rollouts if r.meta["agent_id"] == "B")
+
+    assert len(r_a.steps) == 1
+    assert r_a.steps[0].action == "RAW_A"
+    assert r_a.steps[0].next_obs == "bad action"
+    assert r_a.steps[0].reward == pytest.approx(-0.3)
+    assert r_a.steps[0].info.get("parse_error") is True
+
+    assert len(r_b.steps) == 1
+    assert r_b.steps[0].action == "RAW_B"
+    assert r_b.steps[0].next_obs == "bad action"
+    assert r_b.steps[0].reward == pytest.approx(-0.3)
+    assert r_b.steps[0].info.get("parse_error") is True
