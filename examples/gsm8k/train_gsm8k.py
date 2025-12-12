@@ -68,6 +68,7 @@ async def run_eval(
     system_prompt: str | None,
     concurrency: int,
     max_tokens: int,
+    temperature: float,
 ) -> float:
     """
     Simple eval loop: run each sample once and report accuracy (% correct).
@@ -88,7 +89,7 @@ async def run_eval(
             rollouts = await protocol.run(
                 env=env,
                 max_steps=1,
-                sampling_args={"temperature": 1.0, "max_tokens": max_tokens},
+                sampling_args={"temperature": temperature, "max_tokens": max_tokens},
             )
             info = rollouts[0].steps[-1].info
             return bool(info.get("correct"))
@@ -139,10 +140,18 @@ def main():
     parser.add_argument("--batch-size", type=int, default=2, help="Rollout requests per batch source call")
     parser.add_argument("--train-steps", type=int, default=100)
     parser.add_argument("--group-size", type=int, default=8, help="GRPO group size per prompt")
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default="",
+        help="Optional system prompt for GSM8K env; set to '' to use the model default.",
+    )
+    parser.add_argument("--train-temperature", type=float, default=1.0, help="Sampling temperature for training rollouts.")
     parser.add_argument("--eval-every", type=int, default=10, help="Eval every N train steps.")
     parser.add_argument("--eval-before-start", action="store_true", default=True, help="Run eval once before training begins.")
     parser.add_argument("--eval-limit", type=int, default=500, help="Number of test samples for eval.")
     parser.add_argument("--eval-concurrency", type=int, default=32)
+    parser.add_argument("--eval-temperature", type=float, default=0.0, help="Sampling temperature for eval passes.")
     parser.add_argument("--rollout-log", type=str, default="gsm8k_train_rollouts.jsonl")
     args = parser.parse_args()
 
@@ -173,7 +182,7 @@ def main():
     publisher = create_vllm_publisher(client)
 
     # Registries
-    env_registry = {"gsm8k": lambda sample: GSM8KEnv(sample=sample)}
+    env_registry = {"gsm8k": lambda sample: GSM8KEnv(sample=sample, system_prompt=args.system_prompt)}
 
     def protocol_factory():
         return SingleAgentSyncProtocol(
@@ -200,7 +209,11 @@ def main():
         protocol_registry=protocol_registry,
         jsonl_path=rollout_log_path,
     )
-    sampling_args = {"temperature": 1.0, "max_tokens": 512, "extras": {"extra_body": {"return_token_ids": True}}}
+    sampling_args = {
+        "temperature": args.train_temperature,
+        "max_tokens": 512,
+        "extras": {"extra_body": {"return_token_ids": True}},
+    }
     requests_fn = build_requests_fn(samples_q, args.batch_size, sampling_args, group_size=args.group_size)
     batch_source = RolloutBatchSource(
         orchestrator=engine,
@@ -277,9 +290,10 @@ def main():
                 samples=eval_samples,
                 client=client,
                 model=args.model,
-                system_prompt=None,
+                system_prompt=args.system_prompt,
                 concurrency=args.eval_concurrency,
                 max_tokens=512,
+                temperature=args.eval_temperature,
             )
             print(f"[eval @ step 0] accuracy={acc:.2f}% on {len(eval_samples)} samples")
 
@@ -291,13 +305,14 @@ def main():
             train_step = int(stats["train_step"])
             if args.eval_every > 0 and train_step % args.eval_every == 0 and eval_samples:
                 acc = await run_eval(
-                    samples=eval_samples,
-                    client=client,
-                    model=args.model,
-                    system_prompt=None,
-                    concurrency=args.eval_concurrency,
-                    max_tokens=512,
-                )
+                samples=eval_samples,
+                client=client,
+                model=args.model,
+                system_prompt=args.system_prompt,
+                concurrency=args.eval_concurrency,
+                max_tokens=512,
+                temperature=args.eval_temperature,
+            )
                 print(f"[eval @ step {train_step}] accuracy={acc:.2f}% on {len(eval_samples)} samples")
 
     asyncio.run(train_loop())

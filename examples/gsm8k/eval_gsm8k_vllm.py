@@ -161,7 +161,11 @@ async def eval_dataset(
         enable_weight_updates=False,
     )
 
-    sargs: SamplingArgs = {"temperature": temperature, "max_tokens": max_tokens}
+    sargs: SamplingArgs = {
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "extras": {"extra_body": {"return_token_ids": True}},
+    }
 
     total = 0
     correct = 0
