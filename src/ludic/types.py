@@ -31,9 +31,34 @@ class ChatResponse:
     """
     text: str
     completion_token_ids: Optional[List[int]] = None
-    logprobs: Optional[List[float]] = None
+    completion_logprobs: Optional[List[float]] = None
     finish_reason: Optional[str] = None
     prompt_token_ids: Optional[List[int]] = None
+
+    def to_info(self) -> Dict[str, Any]:
+        """
+        Canonical serialization of "training-relevant" fields into the shared `info`
+        dict shape used throughout the project.
+        """
+        info: Dict[str, Any] = {}
+        if self.prompt_token_ids is not None:
+            info["prompt_token_ids"] = list(self.prompt_token_ids)
+        if self.completion_token_ids is not None:
+            info["completion_token_ids"] = list(self.completion_token_ids)
+        if self.completion_logprobs is not None:
+            info["completion_logprobs"] = list(self.completion_logprobs)
+        if self.finish_reason is not None:
+            info["finish_reason"] = self.finish_reason
+        return info
+
+    def merge_into_info(self, info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Merge this response's canonical fields into an existing `info` dict.
+        """
+        if info is None:
+            info = {}
+        info.update(self.to_info())
+        return info
 
 # ----- Environment level types -----
 

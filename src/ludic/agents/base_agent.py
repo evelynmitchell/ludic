@@ -67,12 +67,7 @@ class Agent:
             resp, client_info = await asyncio.wait_for(coro, timeout=timeout_s)
 
         last_info: Dict[str, Any] = dict(client_info)
-        if resp.prompt_token_ids is not None:
-            last_info["prompt_token_ids"] = resp.prompt_token_ids
-        if resp.completion_token_ids is not None:
-            last_info["completion_token_ids"] = resp.completion_token_ids
-        if resp.logprobs is not None:
-            last_info["completion_logprobs"] = resp.logprobs
+        resp.merge_into_info(last_info)
 
         self.last_info = last_info
         return resp, client_info, last_info
@@ -144,4 +139,3 @@ class Agent:
             timeout_s=timeout_s,
             version=version,
         )
-

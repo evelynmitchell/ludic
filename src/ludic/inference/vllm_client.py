@@ -159,6 +159,7 @@ class VLLMChatClient(ChatClient):
                     .text
                     .completion_token_ids (may be None)
                     .prompt_token_ids (may be None)
+                    .completion_logprobs (may be None)
                     .finish_reason
                 'info' contains raw transport details and args actually sent.
         """
@@ -202,9 +203,10 @@ class VLLMChatClient(ChatClient):
         if return_token_ids:
             extra_body["return_token_ids"] = True
 
-        # Request per-token logprobs unless the caller already set it via extras.
+        # Request per-token logprobs unless the caller already set it (either via
+        # regular kwargs or via SamplingConfig.extras["extra_body"]).
         # vLLM/OpenAI expect `logprobs` as an int (top-k); using 1 avoids disabling it.
-        if "logprobs" not in request_kwargs:
+        if "logprobs" not in request_kwargs and "logprobs" not in extra_body:
             request_kwargs["logprobs"] = 1  # chosen-token logprobs only
 
         if extra_body:
@@ -254,7 +256,7 @@ class VLLMChatClient(ChatClient):
             finish_reason=finish_reason,
             completion_token_ids=completion_token_ids,
             prompt_token_ids=prompt_token_ids,
-            logprobs=completion_logprobs,
+            completion_logprobs=completion_logprobs,
         )
 
         info: Dict[str, Any] = {

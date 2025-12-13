@@ -17,7 +17,7 @@ async def test_vllm_client_returns_logprobs(
     vllm_model_name: str,
 ) -> None:
     """
-    Ensure vLLM returns per-token logprobs when requested (logprobs=0 by default).
+    Ensure vLLM returns per-token logprobs when requested (logprobs=1 by default).
     """
     sampling = get_default_sampling_config()
 
@@ -35,8 +35,8 @@ async def test_vllm_client_returns_logprobs(
 
     assert resp.text.strip() != ""
     assert resp.completion_token_ids is not None
-    assert resp.logprobs is not None
-    assert len(resp.logprobs) == len(resp.completion_token_ids)
+    assert resp.completion_logprobs is not None
+    assert len(resp.completion_logprobs) == len(resp.completion_token_ids)
 
     # Cross-check by teacher-forcing the same model locally.
     # Release client resources before loading HF model to avoid GPU OOM.
@@ -82,7 +82,7 @@ async def test_vllm_client_returns_logprobs(
     completion_mask[:, prompt_len - 1 :] = True  # predictions corresponding to completion tokens
     hf_logprobs = gathered[completion_mask].cpu().tolist()
 
-    assert len(hf_logprobs) == len(resp.logprobs)
+    assert len(hf_logprobs) == len(resp.completion_logprobs)
     # Allow small numeric drift between vLLM and HF scoring.
-    for got, expected in zip(hf_logprobs, resp.logprobs):
+    for got, expected in zip(hf_logprobs, resp.completion_logprobs):
         assert got == pytest.approx(expected, rel=1e-2, abs=0.3)
