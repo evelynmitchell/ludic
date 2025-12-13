@@ -5,6 +5,7 @@ from ludic.envs.env import LudicEnv
 from ludic.agents.base_agent import Agent
 from ludic.types import Rollout, Step, StepOutcome, SamplingArgs
 from .base import InteractionProtocol
+from .info import merge_step_info
 
 class SingleAgentSyncProtocol(InteractionProtocol):
     """
@@ -106,7 +107,10 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                     reward=parser_reward,
                     truncated=False,
                     terminated=False,
-                    info={"parse_error": True, **client_info}
+                    info=merge_step_info(
+                        client_info=client_info,
+                        extra={"parse_error": True},
+                    ),
                 )
                 
                 # Log this failure step
@@ -136,12 +140,12 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                 # Combine parser and env rewards
                 total_reward = env_outcome.reward + parser_reward
                 
-                # Merge info dicts
-                step_info = {
-                    **client_info,
-                    **env_outcome.info,
-                    "parsed_action": parsed_action,
-                }
+                # Merge info dicts (protect reserved training keys from collisions)
+                step_info = merge_step_info(
+                    client_info=client_info,
+                    env_info=env_outcome.info,
+                    extra={"parsed_action": parsed_action},
+                )
 
                 # Create the final, combined outcome
                 outcome = StepOutcome(

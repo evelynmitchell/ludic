@@ -1,9 +1,12 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Union, Optional, TypedDict
+import logging
 import time
 import uuid
 import json
+
+log = logging.getLogger(__name__)
 
 JSON = Union[str, int, float, bool, None, Dict[str, Any], List[Any]]
 
@@ -34,6 +37,19 @@ class ChatResponse:
     completion_logprobs: Optional[List[float]] = None
     finish_reason: Optional[str] = None
     prompt_token_ids: Optional[List[int]] = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.completion_token_ids is not None
+            and self.completion_logprobs is not None
+            and len(self.completion_token_ids) != len(self.completion_logprobs)
+        ):
+            log.warning(
+                "ChatResponse completion_token_ids/completion_logprobs length mismatch "
+                "(%d vs %d).",
+                len(self.completion_token_ids),
+                len(self.completion_logprobs),
+            )
 
     def to_info(self) -> Dict[str, Any]:
         """

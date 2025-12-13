@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import json
 import os
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ludic.envs.env import LudicEnv
 from ludic.interaction.base import InteractionProtocol
@@ -14,7 +15,6 @@ from ludic.training.types import (
     CreditAssigner,
     SAWItem,
     SAWBatch,
-    RolloutStepKey,
     TokenizeFn,
     RolloutRequest,
     ProtocolSpec,
@@ -30,6 +30,176 @@ ProtocolFactory = Callable[..., InteractionProtocol]
 
 EnvRegistry = Dict[str, EnvFactory]
 ProtocolRegistry = Dict[str, ProtocolFactory]
+
+_TOKEN_TRACE_KEYS = {
+    "prompt_token_ids",
+    "completion_token_ids",
+    "completion_logprobs",
+}
+
+
+def _require_finite(value: float, *, what: str, rollout_id: str, step_index: int) -> None:
+    if not math.isfinite(value):
+        raise ValueError(f"Non-finite {what} for rollout {rollout_id}, step {step_index}: {value!r}")
+
+
+def _get_credit_weight(
+    weights: Mapping[Tuple[str, int], float],
+    *,
+    rollout_id: str,
+    step_index: int,
+) -> float:
+    key = (rollout_id, step_index)
+    try:
+        w_raw = weights[key]
+    except KeyError as exc:
+        raise KeyError(
+            "CreditAssigner did not provide a weight for "
+            f"(rollout_id={rollout_id!r}, step_index={step_index}). "
+            "All steps must be covered."
+        ) from exc
+    w = float(w_raw)
+    _require_finite(w, what="credit weight", rollout_id=rollout_id, step_index=step_index)
+    return w
+
+
+def _extract_model_token_ids(
+    info: Mapping[str, Any],
+) -> Optional[Tuple[List[int], List[int]]]:
+    prompt_ids = info.get("prompt_token_ids")
+    completion_ids = info.get("completion_token_ids")
+    if (
+        isinstance(prompt_ids, list)
+        and isinstance(completion_ids, list)
+        and all(isinstance(t, int) for t in prompt_ids)
+        and all(isinstance(t, int) for t in completion_ids)
+    ):
+        return prompt_ids, completion_ids
+    return None
+
+
+def _coerce_completion_logprobs(
+    completion_logprobs: object,
+    *,
+    completion_ids: Sequence[int],
+    rollout_id: str,
+    step_index: int,
+) -> Optional[List[float]]:
+    if completion_logprobs is None:
+        return None
+    if not isinstance(completion_logprobs, list) or not all(
+        isinstance(v, (int, float)) for v in completion_logprobs
+    ):
+        raise ValueError(
+            f"Invalid completion_logprobs type for rollout {rollout_id}, step {step_index}; "
+            "expected List[float]."
+        )
+    if len(completion_logprobs) != len(completion_ids):
+        raise ValueError(
+            f"completion_logprobs length mismatch for rollout {rollout_id}, step {step_index} "
+            f"({len(completion_logprobs)} vs {len(completion_ids)})."
+        )
+    return [float(v) for v in completion_logprobs]
+
+
+def _drop_model_trace_keys(info: Mapping[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in info.items() if k not in _TOKEN_TRACE_KEYS}
+
+
+def _base_item_meta(*, rollout: Rollout, step_index: int, reward: float, comp_len: int, prev_obs: str, action: str) -> Dict[str, Any]:
+    return {
+        "rollout_id": rollout.id,
+        "step_index": step_index,
+        "reward": reward,
+        "prev_obs": prev_obs,
+        "action": action,
+        "total_reward": rollout.total_reward,
+        "completion_length": comp_len,
+        **(rollout.meta),  # Rollout-level meta
+    }
+
+
+def _saw_item_from_model_ids(
+    *,
+    rollout: Rollout,
+    step_index: int,
+    reward: float,
+    weight: float,
+    prev_obs: str,
+    action: str,
+    prompt_ids: Sequence[int],
+    completion_ids: Sequence[int],
+    step_info: Mapping[str, Any],
+    completion_logprobs: Optional[List[float]],
+) -> Tuple[SAWItem, int]:
+    input_ids = list(prompt_ids) + list(completion_ids)
+    attention_mask = [1] * len(input_ids)
+    action_mask = [0] * len(prompt_ids) + [1] * len(completion_ids)
+    comp_len = len(completion_ids)
+
+    meta = _base_item_meta(
+        rollout=rollout,
+        step_index=step_index,
+        reward=reward,
+        comp_len=comp_len,
+        prev_obs=prev_obs,
+        action=action,
+    )
+    meta.update(step_info)
+    if completion_logprobs is not None:
+        meta["completion_logprobs"] = completion_logprobs
+
+    return (
+        SAWItem(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            action_mask=action_mask,
+            weight=weight,
+            meta=meta,
+        ),
+        comp_len,
+    )
+
+
+def _saw_item_from_retokenize(
+    *,
+    rollout: Rollout,
+    step_index: int,
+    reward: float,
+    weight: float,
+    prev_obs: str,
+    action: str,
+    tokenize: TokenizeFn,
+    step_info: Mapping[str, Any],
+) -> Tuple[SAWItem, int]:
+    state_ids = tokenize(prev_obs)
+    action_ids = tokenize(action)
+    comp_len = len(action_ids)
+
+    input_ids = state_ids + action_ids
+    attention_mask = [1] * len(input_ids)
+    action_mask = [0] * len(state_ids) + [1] * len(action_ids)
+
+    meta = _base_item_meta(
+        rollout=rollout,
+        step_index=step_index,
+        reward=reward,
+        comp_len=comp_len,
+        prev_obs=prev_obs,
+        action=action,
+    )
+    meta.update(_drop_model_trace_keys(step_info))
+
+    return (
+        SAWItem(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            action_mask=action_mask,
+            weight=weight,
+            meta=meta,
+        ),
+        comp_len,
+    )
 
 
 class RolloutEngine:
@@ -248,100 +418,55 @@ class RolloutEngine:
 
         for r in rollouts:
             for step in r.steps:
-                key: RolloutStepKey = (r.id, step.index)
+                w = _get_credit_weight(weights, rollout_id=r.id, step_index=step.index)
+                reward = float(step.reward)
+                _require_finite(reward, what="reward", rollout_id=r.id, step_index=step.index)
 
-                try:
-                    w_raw = weights[key]
-                except KeyError as exc:
-                    raise KeyError(
-                        f"CreditAssigner did not provide a weight for "
-                        f"(rollout_id={r.id!r}, step_index={step.index}). "
-                        "All steps must be covered."
-                    ) from exc
-
-                w = float(w_raw)
                 info = step.info or {}
+                model_ids = _extract_model_token_ids(info)
 
-                prompt_ids = info.get("prompt_token_ids")
-                completion_ids = info.get("completion_token_ids")
-                completion_logprobs = info.get("completion_logprobs")
-
-                has_model_ids = (
-                    isinstance(prompt_ids, list)
-                    and isinstance(completion_ids, list)
-                    and all(isinstance(t, int) for t in prompt_ids)
-                    and all(isinstance(t, int) for t in completion_ids)
-                )
-
-                # Use model IDs only if they exist AND retokenize is False
-                if has_model_ids and not retokenize:
-                    input_ids = list(prompt_ids) + list(completion_ids)
-                    attention_mask = [1] * len(input_ids)
-                    action_mask = [0] * len(prompt_ids) + [1] * len(completion_ids)
-                    comp_len = len(completion_ids)
-                    completion_lengths.append(comp_len)
-
-                    items.append(
-                        SAWItem(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            action_mask=action_mask,
-                            weight=w,
-                            meta={
-                                "rollout_id": r.id,
-                                "step_index": step.index,
-                                "reward": step.reward,
-                                "prev_obs": step.prev_obs,
-                                "action": step.action,
-                                "total_reward": r.total_reward,
-                                "completion_length": comp_len,
-                                **(r.meta),  # Rollout-level meta
-                                **(step.info),  # Step-level info
-                            },
-                        )
+                if model_ids is not None and not retokenize:
+                    prompt_ids, completion_ids = model_ids
+                    completion_logprobs = _coerce_completion_logprobs(
+                        info.get("completion_logprobs"),
+                        completion_ids=completion_ids,
+                        rollout_id=r.id,
+                        step_index=step.index,
                     )
-                    continue
-
-                if not retokenize:
-                    raise ValueError(
-                        f"Missing model token IDs for rollout {r.id}, step {step.index}, "
-                        "and retokenize=False. Either enable retokenize=True or fix your "
-                        "Agent/run_episode to store 'prompt_token_ids' and "
-                        "'completion_token_ids' in Step.info."
-                    )
-
-                # Retokenize path
-                state_text = step.prev_obs
-                action_text = step.action
-
-                state_ids = tokenize(state_text)  # type: ignore[arg-type]
-                action_ids = tokenize(action_text)  # type: ignore[arg-type]
-                comp_len = len(action_ids)
-                completion_lengths.append(comp_len)
-
-                input_ids = state_ids + action_ids
-                attention_mask = [1] * len(input_ids)
-                action_mask = [0] * len(state_ids) + [1] * len(action_ids)
-
-                items.append(
-                    SAWItem(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        action_mask=action_mask,
+                    item, comp_len = _saw_item_from_model_ids(
+                        rollout=r,
+                        step_index=step.index,
+                        reward=reward,
                         weight=w,
-                        meta={
-                            "rollout_id": r.id,
-                            "step_index": step.index,
-                            "reward": step.reward,
-                                "prev_obs": step.prev_obs,
-                                "action": step.action,
-                                "total_reward": r.total_reward,
-                                "completion_length": comp_len,
-                                **(r.meta),  # Rollout-level meta
-                                **(step.info),  # Step-level info
-                            },
-                        )
+                        prev_obs=step.prev_obs,
+                        action=step.action,
+                        prompt_ids=prompt_ids,
+                        completion_ids=completion_ids,
+                        step_info=info,
+                        completion_logprobs=completion_logprobs,
                     )
+                else:
+                    if not retokenize:
+                        raise ValueError(
+                            f"Missing model token IDs for rollout {r.id}, step {step.index}, "
+                            "and retokenize=False. Either enable retokenize=True or fix your "
+                            "Agent/run_episode to store 'prompt_token_ids' and "
+                            "'completion_token_ids' in Step.info."
+                        )
+                    assert tokenize is not None
+                    item, comp_len = _saw_item_from_retokenize(
+                        rollout=r,
+                        step_index=step.index,
+                        reward=reward,
+                        weight=w,
+                        prev_obs=step.prev_obs,
+                        action=step.action,
+                        tokenize=tokenize,
+                        step_info=info,
+                    )
+
+                items.append(item)
+                completion_lengths.append(comp_len)
 
         # ---- Build batch-level metadata -----------------------------------
         # Note: num_rollouts reflects total number of *agent trajectories*, not global env episodes.

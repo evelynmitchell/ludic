@@ -7,6 +7,7 @@ from ludic.agents.base_agent import Agent
 from ludic.types import Rollout, Step, StepOutcome, SamplingArgs
 from .base import InteractionProtocol
 from .step_collector import TraceCollector
+from .info import merge_step_info
 
 class MultiAgentProtocol(InteractionProtocol):
     """
@@ -150,7 +151,10 @@ class MultiAgentProtocol(InteractionProtocol):
                         reward=parse_result.reward,
                         truncated=False,
                         terminated=False,
-                        info={"parse_error": True, **client_info}
+                        info=merge_step_info(
+                            client_info=client_info,
+                            extra={"parse_error": True},
+                        ),
                     )
                 else:
                     # Normal environment outcome
@@ -168,7 +172,10 @@ class MultiAgentProtocol(InteractionProtocol):
                         reward=total_reward,
                         truncated=raw_outcome.truncated,
                         terminated=raw_outcome.terminated,
-                        info={**client_info, **raw_outcome.info}
+                        info=merge_step_info(
+                            client_info=client_info,
+                            env_info=raw_outcome.info,
+                        ),
                     )
 
                 # Update flags for global loop break
