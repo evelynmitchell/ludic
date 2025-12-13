@@ -76,12 +76,35 @@ def _collate_saw_items(
         action_mask_list.append(actm)
         weights_list.append(torch.tensor(it.weight, dtype=torch.float32))
 
-    batch = {
+    # old_token_logprobs is optional; collect and sum per-sample if present in meta.
+    old_logp_sums: List[Optional[float]] = []
+    for it in items:
+        token_logps = it.meta.get("old_token_logprobs")
+        if not isinstance(token_logps, list):
+            old_logp_sums.append(None)
+        else:
+            action_len = int(sum(it.action_mask))
+            if action_len != len(token_logps):
+                raise ValueError(
+                    "Length mismatch between old_token_logprobs and the number of action tokens."
+                )
+            try:
+                old_logp_sums.append(float(sum(float(v) for v in token_logps)))
+            except Exception:
+                old_logp_sums.append(None)
+
+    batch: Dict[str, Tensor] = {
         "input_ids": torch.stack(input_ids_list, dim=0).to(device),
         "attention_mask": torch.stack(attn_mask_list, dim=0).to(device),
         "action_mask": torch.stack(action_mask_list, dim=0).to(device),
         "weight": torch.stack(weights_list, dim=0).to(device),
     }
+
+    if any(v is not None for v in old_logp_sums):
+        if any(v is None for v in old_logp_sums):
+            raise ValueError("Mixed presence of old_token_logprobs; either provide them for all samples or none.")
+        tensor_vals = [float(v) for v in old_logp_sums]  # type: ignore[arg-type]
+        batch["old_logp_action"] = torch.tensor(tensor_vals, dtype=torch.float32, device=device)
     return batch
 
 
@@ -458,6 +481,13 @@ class Trainer:
                     
                     # Update the batch with only fresh items
                     saw_batch.items = fresh_items
+
+                # Algorithm-specific preprocessing (CPU-side) before collation.
+                saw_batch = self.algo.preprocess_batch(
+                    saw_batch,
+                    model=self.model,
+                    pad_token_id=self.cfg.pad_token_id,
+                )
 
                 # If the batch is empty (e.g. all stale), drop it and fetch another.
                 if not saw_batch.items:

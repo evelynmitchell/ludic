@@ -183,9 +183,11 @@ class PPOLoss:
         input_ids = batch["input_ids"]
         action_mask = batch["action_mask"]
         advantages = batch["weight"]              # [B]
-        old_logp = batch[self.old_logp_key]       # [B]
+        if self.old_logp_key not in batch:
+            raise KeyError(f"PPOLoss requires '{self.old_logp_key}' in batch.")
 
         logp_action = compute_logp_action(logits, input_ids, action_mask)  # [B]
+        old_logp = batch[self.old_logp_key]       # [B]
 
         # ratio = π_new / π_old
         ratio = torch.exp(logp_action - old_logp)                          # [B]

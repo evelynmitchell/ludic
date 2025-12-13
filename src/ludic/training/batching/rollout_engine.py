@@ -264,6 +264,7 @@ class RolloutEngine:
 
                 prompt_ids = info.get("prompt_token_ids")
                 completion_ids = info.get("completion_token_ids")
+                completion_logprobs = info.get("completion_logprobs")
 
                 has_model_ids = (
                     isinstance(prompt_ids, list)

@@ -202,6 +202,11 @@ class VLLMChatClient(ChatClient):
         if return_token_ids:
             extra_body["return_token_ids"] = True
 
+        # Request per-token logprobs unless the caller already set it via extras.
+        # vLLM/OpenAI expect `logprobs` as an int (top-k); using 1 avoids disabling it.
+        if "logprobs" not in request_kwargs:
+            request_kwargs["logprobs"] = 1  # chosen-token logprobs only
+
         if extra_body:
             request_kwargs["extra_body"] = extra_body
 
@@ -218,11 +223,38 @@ class VLLMChatClient(ChatClient):
         prompt_token_ids = getattr(resp, "prompt_token_ids", None)
         completion_token_ids = getattr(choice, "token_ids", None)
 
+        # Extract per-token logprobs if the server returned them. vLLM follows the
+        # OpenAI-compatible shape where `choice.logprobs.token_logprobs` carries the
+        # per-token values.
+        completion_logprobs = None
+        logprobs_obj = getattr(choice, "logprobs", None)
+        if logprobs_obj is not None:
+            token_logprobs = getattr(logprobs_obj, "token_logprobs", None)
+            if token_logprobs is None and isinstance(logprobs_obj, dict):
+                token_logprobs = (
+                    logprobs_obj.get("token_logprobs")
+                    or logprobs_obj.get("logprobs")
+                )
+            if token_logprobs is None and hasattr(logprobs_obj, "content"):
+                # OpenAI responses may nest token logprobs inside content entries.
+                parts = []
+                for part in getattr(logprobs_obj, "content", []):
+                    lp = getattr(part, "logprob", None)
+                    if lp is None and isinstance(part, dict):
+                        lp = part.get("logprob")
+                    if lp is not None:
+                        parts.append(lp)
+                if parts:
+                    token_logprobs = parts
+            if token_logprobs is not None:
+                completion_logprobs = list(token_logprobs)
+
         chat_resp = ChatResponse(
             text=text,
             finish_reason=finish_reason,
             completion_token_ids=completion_token_ids,
             prompt_token_ids=prompt_token_ids,
+            logprobs=completion_logprobs,
         )
 
         info: Dict[str, Any] = {

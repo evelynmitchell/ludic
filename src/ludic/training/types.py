@@ -115,7 +115,8 @@ class SAWItem:
     - attention_mask: 1/0 attention mask to tell tokens from padding
     - action_mask: 1 on action tokens, 0 on state tokens
     - weight: scalar credit for this sample
-    - meta: arbitrary rollout/step metadata
+    - meta: arbitrary rollout/step metadata (algo-specific fields may live here,
+      e.g., per-token behavior logprobs for PPO)
     """
     input_ids: List[int]
     attention_mask: List[int]

@@ -53,7 +53,7 @@ class Agent:
         Shared single inference helper.
 
         Resolves sampling args, runs the client call (optionally with timeout),
-        merges token IDs into the returned info dict, and updates self.last_info.
+        merges token IDs/logprobs into the returned info dict, and updates self.last_info.
         """
         sampling: SamplingConfig = resolve_sampling_args(sampling_args)
         coro = self._client.complete(
@@ -71,6 +71,8 @@ class Agent:
             last_info["prompt_token_ids"] = resp.prompt_token_ids
         if resp.completion_token_ids is not None:
             last_info["completion_token_ids"] = resp.completion_token_ids
+        if resp.logprobs is not None:
+            last_info["completion_logprobs"] = resp.logprobs
 
         self.last_info = last_info
         return resp, client_info, last_info
@@ -142,3 +144,4 @@ class Agent:
             timeout_s=timeout_s,
             version=version,
         )
+
