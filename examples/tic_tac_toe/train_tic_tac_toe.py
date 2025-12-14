@@ -26,7 +26,7 @@ from ludic.context import FullDialog
 from ludic.inference import VLLMChatClient
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.distributed.adapters import create_vllm_publisher
-from ludic.parsers import compose_parsers, cot_prefix_parser, xml_move_parser
+from ludic.parsers import compose_parsers, think_prefix_parser, xml_tag_parser
 from ludic.training import (
     RLAlgorithm,
     RolloutEngine,
@@ -42,8 +42,8 @@ from ludic.training import (
 )
 from ludic.training import Reducer, RichLiveLogger
 
-# Compose parsers to strip optional <think>...</think> and then require <move>...</move>.
-TICTACTOE_PARSER = compose_parsers(cot_prefix_parser, xml_move_parser)
+# STRICT: require <think>...</think> then exactly one <move>...</move>.
+TICTACTOE_PARSER = compose_parsers(think_prefix_parser, xml_tag_parser("move", exact=True))
 
 async def run_eval(
     *,
@@ -66,7 +66,7 @@ async def run_eval(
             base_prompt = env.suggested_sysprompt or ""
             sys_prompt = (
                 base_prompt
-                + "\n\nThink through the board in <think>...</think> and output your move as a single XML tag, e.g., <move>A1</move>."
+                + "\n\nThink through the board in <think>...</think>. After </think>, output exactly one XML tag of the form <move>A1</move> and nothing else."
             )
             protocol = SingleAgentSyncProtocol(
                 agent=Agent(
@@ -189,7 +189,7 @@ def main():
         base_prompt = TicTacToeEnv().suggested_sysprompt or ""
         prompt = (
             base_prompt
-            + "\n\nThink through the board in <think>...</think> and output your move as a single XML tag, e.g., <move>A1</move>."
+            + "\n\nThink through the board in <think>...</think>. After </think>, output exactly one XML tag of the form <move>A1</move> and nothing else."
         )
         return SingleAgentSyncProtocol(
             agent=Agent(
@@ -298,6 +298,7 @@ def main():
         algo=algo,
         batch_source=batch_source,
         publisher=publisher,
+        enable_gradient_checkpointing=True,
         cfg=cfg,
         checkpoint_config=checkpoint_cfg,
         train_logger=train_logger,

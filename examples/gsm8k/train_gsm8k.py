@@ -107,7 +107,7 @@ def main():
     parser.add_argument("--split", default="train")
     parser.add_argument("--limit", type=int, default=256)
     parser.add_argument("--concurrency", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=2, help="Rollout requests per batch source call")
+    parser.add_argument("--batch-size", type=int, default=8, help="Rollout requests per batch source call")
     parser.add_argument("--train-steps", type=int, default=100)
     parser.add_argument("--group-size", type=int, default=8, help="GRPO group size per prompt")
     parser.add_argument(
@@ -260,6 +260,7 @@ def main():
         algo=algo,
         batch_source=batch_source,
         publisher=publisher,
+        enable_gradient_checkpointing=True,
         cfg=cfg,
         checkpoint_config=checkpoint_cfg,
         train_logger=train_logger,

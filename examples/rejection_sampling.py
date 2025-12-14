@@ -9,7 +9,7 @@ from typing import Dict, Any
 from ludic.agent import Agent
 from ludic.context import FullDialog
 from ludic.inference import VLLMChatClient
-from ludic.parsers import xml_move_parser
+from ludic.parsers import xml_tag_parser
 from ludic.interaction import InteractionProtocol, SingleAgentSyncProtocol
 from ludic.training import RolloutEngine, EnvSpec, ProtocolSpec, RolloutRequest
 from ludic.types import Rollout, SamplingArgs
@@ -104,7 +104,7 @@ async def generate_filtered_data(
                 client=client,           # Shared client
                 model=MODEL_NAME,        # Same model
                 ctx=FullDialog(),  # fresh context; prompt is set via protocol
-                parser=xml_move_parser,  # Stateless parser function
+                parser=xml_tag_parser("move"),  # Stateless parser function
             ),
             prompt=prompt,
         )

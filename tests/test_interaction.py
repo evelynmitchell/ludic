@@ -8,10 +8,10 @@ from ludic.agents.base_agent import Agent
 from ludic.inference.client import ChatResponse
 from ludic.parsers import (
     ParseResult,
-    cot_prefix_parser,
-    xml_move_parser,
+    xml_tag_parser,
     compose_parsers,
     Parser,
+    think_prefix_parser,
 )
 from ludic.types import StepOutcome, Info
 from ludic.envs.env import LudicEnv
@@ -87,8 +87,8 @@ async def test_run_episode_uses_action_parser_and_logs_parsed_action():
     raw_llm_output = "<think>some reasoning</think>\n<move>  A1  </move>"
 
     action_parser: Parser = compose_parsers(
-        cot_prefix_parser,
-        xml_move_parser,
+        think_prefix_parser,
+        xml_tag_parser("move"),
     )
 
     agent = Agent(

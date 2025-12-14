@@ -26,7 +26,7 @@ from ludic.agent import Agent
 from ludic.context import FullDialog
 from ludic.inference import VLLMChatClient, start_vllm_server, wait_for_vllm_health
 from ludic.interaction import SingleAgentSyncProtocol
-from ludic.parsers import ParseResult, cot_prefix_parser
+from ludic.parsers import ParseResult, think_prefix_parser
 from ludic.types import SamplingArgs
 from environments.gsm8k import GSM8KEnv
 from ludic.training import Reducer, apply_reducers_to_records
@@ -65,7 +65,7 @@ def gsm8k_final_answer_parser(raw: str) -> ParseResult:
     - Optionally strips a leading <think>...</think> prefix
     - Requires the final answer in \\boxed{...} or after #### (or as a trailing number)
     """
-    cot = cot_prefix_parser(raw)
+    cot = think_prefix_parser(raw)
     text = cot.action if cot.action is not None else raw.strip()
 
     # Prefer explicit answer delimiters.

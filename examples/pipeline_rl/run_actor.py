@@ -5,7 +5,7 @@ import asyncio
 from ludic.agent import Agent
 from ludic.context import FullDialog
 from ludic.inference import VLLMChatClient
-from ludic.parsers import xml_move_parser
+from ludic.parsers import xml_tag_parser
 from ludic.training import (
     RolloutEngine,
     run_pipeline_actor,
@@ -43,7 +43,7 @@ def create_engine(client: VLLMChatClient) -> RolloutEngine:
                 client=client, 
                 model=MODEL_NAME, 
                 ctx=FullDialog(), 
-                parser=xml_move_parser
+                parser=xml_tag_parser("move")
             ),
             prompt=prompt,
         )

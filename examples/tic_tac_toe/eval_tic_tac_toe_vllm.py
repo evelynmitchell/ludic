@@ -16,7 +16,7 @@ from ludic.agent import Agent
 from ludic.context import FullDialog
 from ludic.inference import VLLMChatClient, start_vllm_server, wait_for_vllm_health
 from ludic.interaction import SingleAgentSyncProtocol
-from ludic.parsers import compose_parsers, cot_prefix_parser, xml_move_parser
+from ludic.parsers import compose_parsers, think_prefix_parser, xml_tag_parser
 from ludic.types import SamplingArgs
 from environments.tic_tac_toe import TicTacToeEnv
 from ludic.training import Reducer, apply_reducers_to_records
@@ -33,7 +33,7 @@ async def eval_episodes(
     max_steps: int,
     concurrency: int = 1,
 ) -> List[dict]:
-    action_parser = compose_parsers(cot_prefix_parser, xml_move_parser)
+    action_parser = compose_parsers(think_prefix_parser, xml_tag_parser("move", exact=True))
     reducers: Dict[str, Reducer] = {
         "win_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "win", normalize_by="rollouts"),
         "loss_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "loss", normalize_by="rollouts"),
@@ -67,7 +67,7 @@ async def eval_episodes(
     base_prompt = base_env.suggested_sysprompt or ""
     sys_prompt = (
         base_prompt
-        + "\n\nThink through the board in <think>...</think> and output your move as a single XML tag, e.g., <move>A1</move>."
+        + "\n\nThink through the board in <think>...</think>. After </think>, output exactly one XML tag of the form <move>A1</move> and nothing else."
     )
 
     idx = 0

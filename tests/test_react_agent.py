@@ -8,7 +8,7 @@ from ludic.context.full_dialog import FullDialog
 from ludic.inference.client import ChatClient, ChatResponse
 from ludic.inference.sampling import SamplingConfig
 from ludic.types import Message
-from ludic.parsers import xml_move_parser
+from ludic.parsers import xml_tag_parser
 from tests._mocks import calculator_tool
 
 # ---------------------------------------------------------------------
@@ -109,7 +109,7 @@ async def test_react_agent_happy_path_single_tool():
         client=client,
         model="mock",
         ctx=FullDialog(),
-        parser=xml_move_parser,
+        parser=xml_tag_parser("move"),
         tools=[calculator_tool]
     )
 
@@ -171,7 +171,7 @@ async def test_react_agent_shot_clock_fallback():
         client=client,
         model="mock",
         ctx=FullDialog(),
-        parser=xml_move_parser,
+        parser=xml_tag_parser("move"),
         tools=[weather_tool],
         max_react_steps=2 # Strict limit
     )
@@ -220,7 +220,7 @@ async def test_react_agent_handles_bad_tool_calls():
         client=client,
         model="mock",
         ctx=FullDialog(),
-        parser=xml_move_parser,
+        parser=xml_tag_parser("move"),
         tools=[calculator_tool] # ghost_tool not here
     )
 
@@ -252,7 +252,7 @@ async def test_react_agent_requires_tool_supported_context():
             client=ReplayMockClient([]),
             model="mock",
             ctx=DumbDialog(), # <-- The culprit
-            parser=xml_move_parser,
+            parser=xml_tag_parser("move"),
             tools=[]
         )
 
@@ -282,7 +282,7 @@ async def test_react_agent_records_bad_json_tool_arguments():
         client=client,
         model="mock",
         ctx=FullDialog(),
-        parser=xml_move_parser,
+        parser=xml_tag_parser("move"),
         tools=[calculator_tool],
         max_react_steps=3,
     )
@@ -326,7 +326,7 @@ async def test_react_agent_records_tool_execution_exception():
         client=client,
         model="mock",
         ctx=FullDialog(),
-        parser=xml_move_parser,
+        parser=xml_tag_parser("move"),
         tools=[explode_tool],
         max_react_steps=3,
     )
@@ -373,7 +373,7 @@ async def test_react_agent_handles_multiple_tool_calls_in_one_turn():
         client=client,
         model="mock",
         ctx=FullDialog(),
-        parser=xml_move_parser,
+        parser=xml_tag_parser("move"),
         tools=[calculator_tool, weather_tool],
         max_react_steps=3,
     )
@@ -427,7 +427,7 @@ async def test_react_agent_multi_tool_calls_continue_on_error():
         client=client,
         model="mock",
         ctx=FullDialog(),
-        parser=xml_move_parser,
+        parser=xml_tag_parser("move"),
         tools=[calculator_tool],
         max_react_steps=3,
     )

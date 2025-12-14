@@ -32,7 +32,7 @@ from ludic.context import FullDialog
 from ludic.inference import VLLMChatClient
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.distributed import create_vllm_publisher
-from ludic.parsers import boxed_parser, compose_parsers, cot_prefix_parser, extract_last_boxed_content
+from ludic.parsers import boxed_parser, compose_parsers, think_prefix_parser, extract_last_boxed_content
 from ludic.training import (
     RLAlgorithm,
     RolloutEngine,
@@ -294,7 +294,7 @@ def main() -> None:
             fsdp.fully_shard(layer, mp_policy=mp_policy)
     fsdp.fully_shard(model, mp_policy=mp_policy)
 
-    action_parser = compose_parsers(cot_prefix_parser, boxed_parser)
+    action_parser = compose_parsers(think_prefix_parser, boxed_parser)
 
     # Shared client for inference (rank0 does weight updates)
     client = VLLMChatClient(
