@@ -21,12 +21,14 @@ class Reducer:
     - transform: optional post-processing of the raw value (e.g., lambda v: v == "win").
     - normalize_by: None | "samples" | "rollouts" — override denominator to
       normalize by total samples or total rollouts.
+    - as_percent: if True, callers may display this metric as a percentage.
     """
 
     kind: ReducerKind
     source: str | Callable[[SAWItem], object]
     transform: Optional[Callable[[object], object]] = None
     normalize_by: NormalizeBy = None
+    as_percent: bool = False
 
 
 def _get_value_from_source(item: SAWItem, source: str | Callable[[SAWItem], object]) -> object:
