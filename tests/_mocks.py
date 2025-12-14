@@ -28,8 +28,13 @@ def calculator_tool(a: int, b: int) -> int:
 # ---- Mock client ---------------------------------------------------------
 
 class MockClient(ChatClient):
-    def __init__(self, text: str = "1") -> None:
+    def __init__(
+        self,
+        text: str = "1",
+        finish_reason: str = "stop",
+    ) -> None:
         self._text = text
+        self._finish_reason = finish_reason
 
     async def complete(
         self,
@@ -38,7 +43,8 @@ class MockClient(ChatClient):
         messages: List[Message],
         sampling: SamplingConfig,
     ) -> tuple[ChatResponse, Dict[str, Any]]:
-        return ChatResponse(text=self._text), {"used_args": asdict(sampling)}
+        resp = ChatResponse(text=self._text, finish_reason=self._finish_reason)
+        return resp, {"used_args": asdict(sampling)}
 
     def sync_weights(self, params: Mapping[str, torch.Tensor], **kwargs) -> str:  # type: ignore[name-defined]
         return "mock-version"
@@ -49,13 +55,18 @@ class MockAgent(Agent):
     Uses FullDialog and a pass-through parser by default.
     """
     def __init__(
-        self, 
-        client: ChatClient = MockClient(), 
+        self,
+        client: ChatClient | None = None,
         model: str = "mock",
-        ctx: ContextStrategy = FullDialog(),
-        parser: Parser = _mock_parser
+        ctx: ContextStrategy | None = None,
+        parser: Parser = _mock_parser,
     ) -> None:
-        super().__init__(client=client, model=model, ctx=ctx, parser=parser)
+        super().__init__(
+            client=client or MockClient(),
+            model=model,
+            ctx=ctx or FullDialog(),
+            parser=parser,
+        )
 
 
 # ---- Seedable Mock Client for GRPO Test ----
@@ -97,15 +108,15 @@ class SeedableMockAgent(Agent):
     An agent wired to the SeedableMockClient.
     """
     def __init__(
-        self, 
+        self,
         seed_map: Dict[int, str],
-        ctx: ContextStrategy = FullDialog(),
-        parser: Parser = _mock_parser
+        ctx: ContextStrategy | None = None,
+        parser: Parser = _mock_parser,
     ) -> None:
         super().__init__(
             client=SeedableMockClient(seed_map), 
             model="seedable_mock",
-            ctx=ctx,
+            ctx=ctx or FullDialog(),
             parser=parser
         )
 

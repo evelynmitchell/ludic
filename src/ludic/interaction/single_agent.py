@@ -182,11 +182,40 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                 # Feed the new observation to the agent
                 agent.on_after_step(obs, info)
 
+        # --- E. Handle Time-Limit Truncation ---
+        # If we exited the loop without env termination/truncation, we hit max_steps.
+        # This is a time-limit truncation and must be recorded for correct RL semantics.
+        episode_truncated = False
+        truncation_reason = None
+
+        if steps:
+            last_step = steps[-1]
+            if last_step.terminated:
+                # Normal termination from env
+                pass
+            elif last_step.truncated:
+                # Env-initiated truncation
+                episode_truncated = True
+                truncation_reason = "env"
+            else:
+                # We completed max_steps without env ending the episode
+                # This is a time-limit truncation
+                episode_truncated = True
+                truncation_reason = "max_steps"
+                last_step.truncated = True
+                # Only clear next_obs if it wasn't a parser failure (which has synthetic obs).
+                # Parser failures have parse_error=True in info.
+                if not last_step.info.get("parse_error"):
+                    last_step.next_obs = None
+                last_step.info = {**last_step.info, "truncation_reason": "max_steps"}
+
         rollout = Rollout(
             steps=steps,
             meta={
                 "agent_name": getattr(agent, "name", "unknown"),
                 "env_name": env.__class__.__name__,
+                "episode_truncated": episode_truncated,
+                "truncation_reason": truncation_reason,
             }
         )
 

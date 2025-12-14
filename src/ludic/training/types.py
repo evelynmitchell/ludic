@@ -157,3 +157,6 @@ class BatchSource(Protocol):
 
 TokenizeFn = Callable[[str], List[int]]
 StateFromStepFn = Callable[[Rollout, int, Step], str]
+
+# Filter function: returns True to KEEP a sample, False to DROP it
+SampleFilter = Callable[["SAWItem"], bool]

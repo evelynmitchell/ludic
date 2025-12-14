@@ -19,6 +19,7 @@ from ludic.training.types import (
     RolloutRequest,
     ProtocolSpec,
     EnvSpec,
+    SampleFilter,
 )
 
 # ---------------------------------------------------------------------------
@@ -106,7 +107,17 @@ def _drop_model_trace_keys(info: Mapping[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in info.items() if k not in _TOKEN_TRACE_KEYS}
 
 
-def _base_item_meta(*, rollout: Rollout, step_index: int, reward: float, comp_len: int, prev_obs: str, action: str) -> Dict[str, Any]:
+def _base_item_meta(
+    *,
+    rollout: Rollout,
+    step_index: int,
+    reward: float,
+    comp_len: int,
+    prev_obs: str,
+    action: str,
+    truncated: bool,
+    terminated: bool,
+) -> Dict[str, Any]:
     return {
         "rollout_id": rollout.id,
         "step_index": step_index,
@@ -115,7 +126,9 @@ def _base_item_meta(*, rollout: Rollout, step_index: int, reward: float, comp_le
         "action": action,
         "total_reward": rollout.total_reward,
         "completion_length": comp_len,
-        **(rollout.meta),  # Rollout-level meta
+        "truncated": truncated,
+        "terminated": terminated,
+        **(rollout.meta),  # Rollout-level meta (includes episode_truncated, truncation_reason)
     }
 
 
@@ -131,6 +144,8 @@ def _saw_item_from_model_ids(
     completion_ids: Sequence[int],
     step_info: Mapping[str, Any],
     completion_logprobs: Optional[List[float]],
+    truncated: bool,
+    terminated: bool,
 ) -> Tuple[SAWItem, int]:
     input_ids = list(prompt_ids) + list(completion_ids)
     attention_mask = [1] * len(input_ids)
@@ -144,6 +159,8 @@ def _saw_item_from_model_ids(
         comp_len=comp_len,
         prev_obs=prev_obs,
         action=action,
+        truncated=truncated,
+        terminated=terminated,
     )
     meta.update(step_info)
     if completion_logprobs is not None:
@@ -171,6 +188,8 @@ def _saw_item_from_retokenize(
     action: str,
     tokenize: TokenizeFn,
     step_info: Mapping[str, Any],
+    truncated: bool,
+    terminated: bool,
 ) -> Tuple[SAWItem, int]:
     state_ids = tokenize(prev_obs)
     action_ids = tokenize(action)
@@ -187,6 +206,8 @@ def _saw_item_from_retokenize(
         comp_len=comp_len,
         prev_obs=prev_obs,
         action=action,
+        truncated=truncated,
+        terminated=terminated,
     )
     meta.update(_drop_model_trace_keys(step_info))
 
@@ -386,19 +407,26 @@ class RolloutEngine:
         concurrency: int = 8,
         retokenize: bool = False,
         tokenize: Optional[TokenizeFn] = None,
+        sample_filter: Optional[SampleFilter] = None,
     ) -> SAWBatch:
         """
         High-level entrypoint for RL-style training:
-        
+
         1. Generates rollouts.
         2. Computes credit (advantages/rewards).
         3. Collates into SAWItems (handling tokenization/masking).
-        
+        4. Optionally filters samples based on metadata.
+
         Tokenization strategy:
         - If Step.info contains `prompt_token_ids` and `completion_token_ids`,
           those are used *unless* retokenize=True.
         - Otherwise, if retokenize=True, use provided tokenizer.
         - Else raise an error.
+
+        Filtering:
+        - If sample_filter is provided, it's applied after SAWItems are created.
+        - Filter returns True to KEEP a sample, False to DROP it.
+        - Use ludic.training.filters for common predicates.
         """
         assert (not retokenize) or tokenize, (
             "Either use a chat client that populates token IDs, "
@@ -413,8 +441,7 @@ class RolloutEngine:
         )
         weights = credit_assigner.compute(rollouts)
 
-        items: List[SAWItem] = []
-        completion_lengths: List[int] = []
+        items_with_lengths: List[Tuple[SAWItem, int]] = []
 
         for r in rollouts:
             for step in r.steps:
@@ -444,6 +471,8 @@ class RolloutEngine:
                         completion_ids=completion_ids,
                         step_info=info,
                         completion_logprobs=completion_logprobs,
+                        truncated=step.truncated,
+                        terminated=step.terminated,
                     )
                 else:
                     if not retokenize:
@@ -463,16 +492,33 @@ class RolloutEngine:
                         action=step.action,
                         tokenize=tokenize,
                         step_info=info,
+                        truncated=step.truncated,
+                        terminated=step.terminated,
                     )
 
-                items.append(item)
-                completion_lengths.append(comp_len)
+                items_with_lengths.append((item, comp_len))
+
+        # ---- Apply sample filter ------------------------------------------
+        num_before_filter = len(items_with_lengths)
+        if sample_filter is not None:
+            items_with_lengths = [
+                (item, comp_len)
+                for (item, comp_len) in items_with_lengths
+                if sample_filter(item)
+            ]
+        num_after_filter = len(items_with_lengths)
+        num_filtered = num_before_filter - num_after_filter
+
+        items: List[SAWItem] = [item for (item, _comp_len) in items_with_lengths]
+        completion_lengths: List[int] = [comp_len for (_item, comp_len) in items_with_lengths]
 
         # ---- Build batch-level metadata -----------------------------------
         # Note: num_rollouts reflects total number of *agent trajectories*, not global env episodes.
         meta = {
             "num_rollouts": len(rollouts),
-            "num_samples": len(items),
+            "num_samples_before_filter": num_before_filter,
+            "num_samples": num_after_filter,
+            "num_samples_filtered": num_filtered,
             "avg_total_reward": (
                 float(sum(r.total_reward for r in rollouts) / len(rollouts))
                 if rollouts else 0.0

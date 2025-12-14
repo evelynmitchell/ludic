@@ -156,7 +156,11 @@ def vllm_server(request) -> VLLMServerHandle:
         ])
 
     handle = VLLMServerHandle(host=host, port=port, cmd=cmd, env=env, dtype=dtype)
-    handle.start()
+    try:
+        handle.start()
+    except Exception as exc:  # noqa: BLE001
+        handle.stop()
+        pytest.skip(f"vLLM server failed to start: {exc}")
     yield handle
     handle.stop()
 

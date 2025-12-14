@@ -10,36 +10,54 @@ from ludic.inference.sampling import SamplingConfig, resolve_sampling_args
 from ludic.context.base import ContextStrategy
 from ludic.parsers import Parser, ParseResult
 
+_DEFAULT_INCOMPLETE_FEEDBACK = (
+    "Your response was cut off because it exceeded the token limit. "
+    "Please provide a shorter, more concise response."
+)
+
+
 class Agent:
     """
     A stateful, logical actor that bundles inference, context, and parsing.
-    
+
     It holds a reference to a (potentially shared) ChatClient and manages
     its own internal state via its ContextStrategy.
     """
+
     name: str = "agent"
 
     def __init__(
-        self, 
-        *, 
-        client: ChatClient, 
+        self,
+        *,
+        client: ChatClient,
         model: str,
         ctx: ContextStrategy,
-        parser: Parser
+        parser: Parser,
+        reject_incomplete_completions: bool = True,
+        incomplete_completion_penalty: float = -0.1,
+        incomplete_completion_feedback: str = _DEFAULT_INCOMPLETE_FEEDBACK,
     ) -> None:
         """
         Initializes the Agent.
-        
+
         Args:
             client: The ChatClient for inference.
             model: The model name this agent should use.
             ctx: An instance of a ContextStrategy for managing memory.
             parser: An instance of a Parser for decoding actions.
+            reject_incomplete_completions: If True, completions that hit max_tokens
+                (finish_reason="length") are treated as parse failures with feedback.
+            incomplete_completion_penalty: Reward penalty for incomplete completions.
+            incomplete_completion_feedback: Feedback message shown to agent when
+                its completion is cut off.
         """
         self._client = client
         self._model = model
         self._ctx = ctx
         self._parser = parser
+        self._reject_incomplete = reject_incomplete_completions
+        self._incomplete_penalty = incomplete_completion_penalty
+        self._incomplete_feedback = incomplete_completion_feedback
         self.last_info: Dict[str, Any] = {}
 
     async def _infer_once(
@@ -91,14 +109,14 @@ class Agent:
     ) -> Tuple[ParseResult, str, Dict[str, Any]]:
         """
         Runs the think -> act -> parse cycle based on current context.
-        
+
         This method does *not* take obs/info, as those are fed to the
         agent via on_env_reset() and on_after_step().
-        
+
         Args:
             sampling_args: The sampling configuration for this step.
             timeout_s: Optional timeout for the inference call.
-            
+
         Returns:
             A tuple of (ParseResult, raw_action_text, client_info_dict).
         """
@@ -111,14 +129,26 @@ class Agent:
             sampling_args=sampling_args,
             timeout_s=timeout_s,
         )
-        
+
         # 3. Update memory with the agent's own response
         self._ctx.on_after_act(resp)
-        
-        # 4. Parse (format the raw text action)
+
         raw_action = resp.text
+
+        # 4. Check for incomplete completion (hit max_tokens)
+        if self._reject_incomplete and last_info.get("finish_reason") == "length":
+            parse_result = ParseResult(
+                action=None,
+                reward=self._incomplete_penalty,
+                obs=self._incomplete_feedback,
+            )
+            # Mark this in info for downstream tracking
+            last_info["incomplete_completion"] = True
+            return parse_result, raw_action, last_info
+
+        # 5. Parse (format the raw text action)
         parse_result = self._parser(raw_action)
-        
+
         return parse_result, raw_action, last_info
 
     def push_policy_update(

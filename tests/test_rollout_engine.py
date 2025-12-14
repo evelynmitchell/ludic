@@ -23,6 +23,7 @@ from ludic.training.types import (
     RolloutRequest,
 )
 from ludic.training.credit_assignment import MonteCarloReturn
+from ludic.training.filters import drop_truncated
 from ludic.types import Rollout, SamplingArgs, Step
 
 from tests._mocks import MockClient, _mock_parser, MockAgent
@@ -571,3 +572,205 @@ async def test_rollout_batch_source_next_batch_integration(
         assert item.meta.get("request_meta", {}).get("batch_source") is True
         assert "rollout_id" in item.meta
         assert "step_index" in item.meta
+
+
+@pytest.mark.asyncio
+async def test_rollout_batch_source_passes_sample_filter(
+    env_registry,
+) -> None:
+    agent = MockAgent(client=MockClient(text="wrong"))
+    protocol_registry = {
+        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent)
+    }
+
+    engine = RolloutEngine(
+        env_registry=env_registry,
+        protocol_registry=protocol_registry,
+    )
+
+    credit_assigner = MonteCarloReturn()
+
+    def requests_fn() -> List[RolloutRequest]:
+        return [
+            RolloutRequest(
+                env=EnvSpec(kind="mock", kwargs={"max_steps": 10, "target": "win"}),
+                protocol=ProtocolSpec(kind="mock_protocol"),
+                num_episodes=1,
+            )
+        ]
+
+    batch_source = RolloutBatchSource(
+        orchestrator=engine,
+        credit_assigner=credit_assigner,
+        requests_fn=requests_fn,
+        max_steps=3,
+        retokenize=True,
+        tokenize=fake_tokenize,
+        sample_filter=drop_truncated,
+    )
+
+    batch = await batch_source.next_batch()
+
+    assert batch.meta["num_samples_before_filter"] == 3
+    assert batch.meta["num_samples"] == 2
+    assert all(item.meta.get("truncated") is False for item in batch.items)
+
+
+@pytest.mark.asyncio
+async def test_saw_item_contains_truncation_flags(
+    env_registry,
+) -> None:
+    """
+    SAWItem.meta should contain 'truncated' and 'terminated' flags
+    propagated from the Step, as well as episode-level truncation info
+    from Rollout.meta.
+    """
+
+    agent = MockAgent(client=MockClient(text="wrong"))  # Never terminates
+    protocol_registry = {
+        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent),
+    }
+
+    engine = RolloutEngine(
+        env_registry=env_registry,
+        protocol_registry=protocol_registry,
+    )
+
+    credit_assigner = MonteCarloReturn()
+
+    def fake_tokenize(s: str) -> List[int]:
+        return [ord(c) % 100 for c in s[:10]]
+
+    requests = [
+        RolloutRequest(
+            env=EnvSpec(kind="mock", kwargs={"max_steps": 10, "target": "win"}),
+            protocol=ProtocolSpec(kind="mock_protocol"),
+            num_episodes=1,
+        )
+    ]
+
+    # max_steps=3 means we'll truncate at step 3
+    batch = await engine.generate_batch(
+        requests=requests,
+        max_steps=3,
+        credit_assigner=credit_assigner,
+        retokenize=True,
+        tokenize=fake_tokenize,
+    )
+
+    assert len(batch.items) == 3
+
+    # First two steps: not truncated, not terminated
+    for i in range(2):
+        item = batch.items[i]
+        assert item.meta.get("truncated") is False
+        assert item.meta.get("terminated") is False
+
+    # Last step: truncated due to max_steps
+    last_item = batch.items[-1]
+    assert last_item.meta.get("truncated") is True
+    assert last_item.meta.get("terminated") is False
+    assert last_item.meta.get("truncation_reason") == "max_steps"
+
+    # Episode-level truncation info
+    assert last_item.meta.get("episode_truncated") is True
+
+
+@pytest.mark.asyncio
+async def test_generate_batch_applies_sample_filter_and_updates_counts(
+    env_registry,
+) -> None:
+    agent = MockAgent(client=MockClient(text="wrong"))  # Never terminates
+    protocol_registry = {
+        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent),
+    }
+
+    engine = RolloutEngine(
+        env_registry=env_registry,
+        protocol_registry=protocol_registry,
+    )
+
+    credit_assigner = MonteCarloReturn()
+
+    requests = [
+        RolloutRequest(
+            env=EnvSpec(kind="mock", kwargs={"max_steps": 10, "target": "win"}),
+            protocol=ProtocolSpec(kind="mock_protocol"),
+            num_episodes=1,
+        )
+    ]
+
+    batch = await engine.generate_batch(
+        requests=requests,
+        max_steps=3,
+        credit_assigner=credit_assigner,
+        retokenize=True,
+        tokenize=fake_tokenize,
+        sample_filter=drop_truncated,
+    )
+
+    assert batch.meta["num_samples_before_filter"] == 3
+    assert batch.meta["num_samples"] == 2
+    assert batch.meta["num_samples_filtered"] == 1
+    assert len(batch.items) == 2
+    assert all(item.meta.get("truncated") is False for item in batch.items)
+
+
+@pytest.mark.asyncio
+async def test_avg_completion_length_respects_filtered_items(
+    env_registry,
+) -> None:
+    class SeqClient(MockClient):
+        def __init__(self, texts: List[str]) -> None:
+            super().__init__(text=texts[0])
+            self._texts = list(texts)
+            self._i = 0
+
+        async def complete(  # type: ignore[override]
+            self,
+            *,
+            model: str,
+            messages: List[Dict[str, str]],
+            sampling: SamplingConfig,
+            **kwargs,
+        ) -> Tuple[ChatResponse, Dict[str, Any]]:
+            text = self._texts[min(self._i, len(self._texts) - 1)]
+            self._i += 1
+            return ChatResponse(text=text), {"used_args": sampling.to_openai_kwargs()}
+
+    agent = Agent(
+        client=SeqClient(["a", "bb", "ccc"]),
+        model="mock",
+        ctx=FullDialog(),
+        parser=_mock_parser,
+    )
+    protocol_registry = {
+        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent),
+    }
+
+    engine = RolloutEngine(
+        env_registry=env_registry,
+        protocol_registry=protocol_registry,
+    )
+
+    credit_assigner = MonteCarloReturn()
+    requests = [
+        RolloutRequest(
+            env=EnvSpec(kind="mock", kwargs={"max_steps": 10, "target": "win"}),
+            protocol=ProtocolSpec(kind="mock_protocol"),
+            num_episodes=1,
+        )
+    ]
+
+    # Keep only the first step so avg_completion_length should match len("a") == 1.
+    batch = await engine.generate_batch(
+        requests=requests,
+        max_steps=3,
+        credit_assigner=credit_assigner,
+        retokenize=True,
+        tokenize=fake_tokenize,
+        sample_filter=lambda item: item.meta.get("step_index") == 0,
+    )
+
+    assert batch.meta["num_samples"] == 1
+    assert batch.meta["avg_completion_length"] == pytest.approx(1.0)
