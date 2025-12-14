@@ -31,15 +31,13 @@ from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import boxed_parser
 from ludic.distributed.adapters import create_vllm_publisher
 from ludic.training import (
-    RLAlgorithm,
     RolloutEngine,
     RolloutBatchSource,
     Trainer,
     TrainerConfig,
     CheckpointConfig,
     make_dataset_queue_requests_fn,
-    GroupNormalizedReturn,
-    ReinforceLoss,
+    make_grpo,
 )
 from ludic.training import Reducer, RichLiveLogger
 
@@ -166,11 +164,13 @@ def main():
 
     protocol_registry = {"single_agent": protocol_factory}
 
-    # Algorithm first (GRPO-style)
-    algo = RLAlgorithm(
+    # Algorithm (GRPO-style: group-relative advantages + PPO clipped objective)
+    algo = make_grpo(
         name="grpo",
-        credit_assigner=GroupNormalizedReturn(normalize_adv=True),
-        loss=ReinforceLoss(length_normalize=True),
+        group_size=args.group_size,
+        group_normalize_adv=True,
+        clip_eps=0.2,
+        length_normalize=True,
     )
 
     # Engine + batch source

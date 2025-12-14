@@ -1,5 +1,6 @@
 from __future__ import annotations
 import random
+import uuid
 from typing import List, Protocol
 from dataclasses import replace
 from ludic.training.types import RolloutRequest
@@ -29,6 +30,8 @@ class GRPORequestStrategy:
     Invariants enforced:
     1. All G variants share the same Env seed (same prompt/problem/environment configuration).
     2. All G variants have distinct Sampling seeds (diverse answers/actions).
+    3. All G variants share the same `group_id` in their meta, enabling correct
+       grouping during credit assignment (even if prompts are identical across groups).
 
     This ensures that when we group them later for advantage estimation (Group Normalization),
     we are comparing apples to apples (same problem, different solutions).
@@ -57,7 +60,10 @@ class GRPORequestStrategy:
                 "seed", self._rng.randint(0, 2**32 - 1)
             )
 
-            # 3. Create G variants for this group.
+            # 3. Generate a unique group_id for this base request's expansion.
+            group_id = str(uuid.uuid4())
+
+            # 4. Create G variants for this group.
             for i in range(self.group_size):
                 # Create new sampling args with a *different* seed for each member.
                 # We add 'i' to ensure deterministic diversity within the group.
@@ -66,12 +72,16 @@ class GRPORequestStrategy:
                     "seed": base_sampling_seed + i,
                 }
 
+                # Merge group_id into request meta
+                new_meta = {**base_req.meta, "group_id": group_id}
+
                 # Create a copy of the request, forcing the group env seed
                 # and the diverse sampling args.
                 new_req = replace(
                     base_req,
                     seed=group_env_seed,
                     sampling_args=new_sampling_args,
+                    meta=new_meta,
                     # Crucial: Each expanded request represents exactly ONE execution trace.
                     # The original 'num_episodes' on the base request is interpreted as
                     # "Number of groups to generate", so we effectively unroll that loop here if needed,

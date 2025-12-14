@@ -120,7 +120,7 @@ async def test_grpo_e2e_seed_grouping_and_credit() -> None:
     # Use the new SeedableMockAgent
     # agent = SeedableMockAgent(seed_map=seed_to_action_map) # <-- Removed
 
-    credit_assigner = GroupNormalizedReturn(normalize_adv=True)
+    credit_assigner = GroupNormalizedReturn(group_size=G_PER_GROUP, normalize_adv=True)
 
     # --- Create the Protocol Factory ---
     # This creates a new agent worker for each concurrent rollout

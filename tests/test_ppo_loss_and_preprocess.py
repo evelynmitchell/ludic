@@ -7,10 +7,10 @@ import pytest
 import torch
 from torch import nn
 
-from ludic.training.loss import PPOLoss
+from ludic.training.loss import ClippedSurrogateLoss
 from ludic.training.trainer import _collate_saw_items
 from ludic.training.types import SAWItem, SAWBatch
-from ludic.training.algorithm import PPOAlgorithm
+from ludic.training.algorithm import RLAlgorithm, make_old_logprob_preprocessor
 from ludic.training.credit_assignment import MonteCarloReturn
 
 
@@ -44,7 +44,7 @@ def make_item(input_ids: List[int], action_mask: List[int], meta: Dict[str, Any]
 
 
 def test_ppoloss_requires_old_logp():
-    loss_fn = PPOLoss()
+    loss_fn = ClippedSurrogateLoss()
     logits = torch.zeros((1, 3, 2))
     batch = {
         "input_ids": torch.tensor([[0, 1, 0]], dtype=torch.long),
@@ -88,11 +88,11 @@ def test_collate_mismatched_behavior_logprobs_raises():
 
 def test_ppopreprocess_backfills_missing_logprobs():
     model = DummyModel(vocab_size=3)
-    algo = PPOAlgorithm(
+    algo = RLAlgorithm(
         name="ppo",
         credit_assigner=MonteCarloReturn(),
-        loss=PPOLoss(),
-        backfill_chunk_size=1,
+        loss=ClippedSurrogateLoss(),
+        preprocess=make_old_logprob_preprocessor(backfill_chunk_size=1),
     )
     items = [
         make_item([0, 1, 2], [0, 1, 1], meta={}),
@@ -115,10 +115,11 @@ def test_ppopreprocess_backfills_missing_logprobs():
 
 def test_ppopreprocess_async_batch_missing_logprobs_raises():
     model = DummyModel(vocab_size=3)
-    algo = PPOAlgorithm(
+    algo = RLAlgorithm(
         name="ppo",
         credit_assigner=MonteCarloReturn(),
-        loss=PPOLoss(),
+        loss=ClippedSurrogateLoss(),
+        preprocess=make_old_logprob_preprocessor(),
     )
     items = [
         make_item([0, 1, 2], [0, 1, 1], meta={"policy_version": 1}),

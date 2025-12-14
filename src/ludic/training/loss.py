@@ -163,9 +163,9 @@ class ReinforceBaselineLoss:
 
 
 @dataclass
-class PPOLoss:
+class ClippedSurrogateLoss:
     """
-    PPO clipped policy loss (actor part only):
+    PPO-style clipped surrogate policy loss (actor part only):
 
         r = π_new(a|s) / π_old(a|s)
         L_clip = - E[ min(r * A, clip(r, 1 - eps, 1 + eps) * A) ]
@@ -178,16 +178,25 @@ class PPOLoss:
 
     clip_eps: float = 0.2
     old_logp_key: str = "old_logp_action"
+    length_normalize: bool = False
 
     def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
         input_ids = batch["input_ids"]
         action_mask = batch["action_mask"]
         advantages = batch["weight"]              # [B]
         if self.old_logp_key not in batch:
-            raise KeyError(f"PPOLoss requires '{self.old_logp_key}' in batch.")
+            raise KeyError(f"ClippedSurrogateLoss requires '{self.old_logp_key}' in batch.")
 
-        logp_action = compute_logp_action(logits, input_ids, action_mask)  # [B]
-        old_logp = batch[self.old_logp_key]       # [B]
+        logp_action = compute_logp_action(
+            logits,
+            input_ids,
+            action_mask,
+            length_normalize=self.length_normalize,
+        )  # [B]
+        old_logp = batch[self.old_logp_key]  # [B]
+        if self.length_normalize:
+            lengths = action_mask[:, 1:].to(old_logp.dtype).sum(dim=-1).clamp(min=1.0)
+            old_logp = old_logp / lengths
 
         # ratio = π_new / π_old
         ratio = torch.exp(logp_action - old_logp)                          # [B]
@@ -237,13 +246,22 @@ class KLLoss:
 
     coeff: float = 1.0
     old_logp_key: str = "old_logp_action"
+    length_normalize: bool = False
 
     def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
         input_ids = batch["input_ids"]
         action_mask = batch["action_mask"]
         old_logp = batch[self.old_logp_key]       # [B]
 
-        logp_new = compute_logp_action(logits, input_ids, action_mask)     # [B]
+        logp_new = compute_logp_action(
+            logits,
+            input_ids,
+            action_mask,
+            length_normalize=self.length_normalize,
+        )  # [B]
+        if self.length_normalize:
+            lengths = action_mask[:, 1:].to(old_logp.dtype).sum(dim=-1).clamp(min=1.0)
+            old_logp = old_logp / lengths
 
         kl = logp_new - old_logp                                           # [B]
         loss = self.coeff * kl.mean()

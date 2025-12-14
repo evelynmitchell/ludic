@@ -18,9 +18,9 @@ from .types import (
 )
 from .algorithm import (
     RLAlgorithm,
-    PPOAlgorithm,
     make_reinforce,
     make_reinforce_baseline,
+    make_grpo,
 )
 from .credit_assignment import (
     GroupNormalizedReturn,
@@ -32,7 +32,7 @@ from .loss import (
     Loss,
     ReinforceLoss,
     ReinforceBaselineLoss,
-    PPOLoss,
+    ClippedSurrogateLoss,
     KLLoss,
     EntropyBonus,
     LossTerm,
@@ -66,9 +66,9 @@ __all__ = [
     "CheckpointConfig",
     # Algorithm composition
     "RLAlgorithm",
-    "PPOAlgorithm",
     "make_reinforce",
     "make_reinforce_baseline",
+    "make_grpo",
     # Credit assignment
     "GroupNormalizedReturn",
     "MonteCarloReturn",
@@ -78,7 +78,7 @@ __all__ = [
     "Loss",
     "ReinforceLoss",
     "ReinforceBaselineLoss",
-    "PPOLoss",
+    "ClippedSurrogateLoss",
     "KLLoss",
     "EntropyBonus",
     "LossTerm",
