@@ -106,3 +106,12 @@ Planned refactor (breaking change):
 - Handle multiplicity at a higher layer by explicitly generating more requests, e.g. via:
   - `RequestStrategy.expand(...)` (one-to-many request transforms), and/or
   - a small helper to “repeat” a request with deterministic seeding.
+
+
+## Sampling Config Cleanup (future)
+
+Today examples sometimes pass ad hoc sampling dicts with `extras`. A better path:
+- Make `SamplingConfig` the single path end-to-end (RolloutRequest, eval CLIs, examples).
+- Add explicit fields for `logprobs`, `return_token_ids`, `return_prompt_logprobs`, and structured `vllm_xargs` instead of freeform `extras`.
+- Normalize to OpenAI-compatible kwargs in `to_openai_kwargs()` (e.g., map `logprobs` → `{"logprobs": True/False, "top_logprobs": K}`) and drop dict merging in examples.
+- Derive `return_token_ids` from `SamplingConfig` rather than passing it separately to `VLLMChatClient.complete`.
