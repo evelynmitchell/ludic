@@ -27,9 +27,12 @@ class GroupNormalizedReturn:
         group_size: Number of rollouts per group.
         normalize_adv: Whether to normalize advantages to zero mean / unit std
             within each group.
+        positive_only: If True, clip negative advantages to 0 so only
+            rewarding trajectories receive credit (no punishments).
     """
     group_size: int
     normalize_adv: bool = False
+    positive_only: bool = False
 
     def __post_init__(self):
         if self.group_size <= 0:
@@ -73,6 +76,9 @@ class GroupNormalizedReturn:
 
             # 3. Compute advantages (A_i = R_i - b)
             advantages = rewards - baseline
+
+            if self.positive_only:
+                advantages = torch.clamp(advantages, min=0.0)
 
             # 4. (Optional) Normalize advantages (zero mean, unit std)
             if self.normalize_adv:
@@ -176,5 +182,37 @@ class EpisodicReturn:
             for step in r.steps:
                 key: RolloutStepKey = (r.id, step.index)
                 out[key] = R_ep
+
+        return out
+
+
+@dataclass
+class ConstantCredit:
+    """
+    Assigns a constant weight to every step in every rollout.
+
+    This is the credit assignment for SFT / behavioral cloning:
+    all actions are treated equally (weight=1.0 by default).
+
+    Can also be used for AWR-style offline RL by setting the constant
+    to exp(advantage / temperature) externally, though typically you'd
+    use a more sophisticated assigner for that.
+
+    Args:
+        value: The constant weight to assign to all steps. Default 1.0.
+    """
+
+    value: float = 1.0
+
+    def compute(
+        self,
+        rollouts: List[Rollout],
+    ) -> Dict[RolloutStepKey, float]:
+        out: Dict[RolloutStepKey, float] = {}
+
+        for r in rollouts:
+            for step in r.steps:
+                key: RolloutStepKey = (r.id, step.index)
+                out[key] = self.value
 
         return out

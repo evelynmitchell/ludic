@@ -85,6 +85,9 @@ class Agent:
             resp, client_info = await asyncio.wait_for(coro, timeout=timeout_s)
 
         last_info: Dict[str, Any] = dict(client_info)
+        # Store prompt and completion for logging/training
+        last_info["chat_prompt_messages"] = messages
+        last_info["chat_completion"] = {"role": "assistant", "content": resp.text}
         resp.merge_into_info(last_info)
 
         self.last_info = last_info

@@ -196,6 +196,7 @@ def main() -> None:
         default=True,
         help="Silence stdout/logging on non-rank0 processes (recommended).",
     )
+    parser.add_argument("--final-save", action="store_true", help="Save a final checkpoint after training completes.")
     args = parser.parse_args()
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -465,6 +466,14 @@ def main() -> None:
                     await trainer.eval()
 
     asyncio.run(train_loop())
+
+    if args.final_save:
+        try:
+            ckpt_path = trainer.save_checkpoint(metadata={"final": True})
+            if rank == 0:
+                print(f"Final checkpoint saved to: {ckpt_path}")
+        except RuntimeError:
+            pass  # No checkpointer configured
 
     dist.destroy_process_group()
 

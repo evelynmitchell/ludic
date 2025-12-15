@@ -35,6 +35,7 @@ This is aspirational and built for researchers who want clean abstractions and h
 - `environments/`: runnable example envs (Tic-Tac-Toe, GSM8K-style QA).
 - `examples/`: entry points for Tic-Tac-Toe GRPO + LoRA, GSM8K training/eval, FSDP2 math training, pipeline RL actor/trainer, and rejection sampling.
 - `tests/`: unit/integration coverage (markers: `integration`, `gpu`).
+- `scripts/`: standalone utilities (e.g., `push_to_hub.py` for uploading checkpoints to HuggingFace Hub).
 
 ### Examples at a glance (what each one is for)
 - Tic-Tac-Toe (`examples/tic_tac_toe/train_tic_tac_toe.py`): LoRA fine-tuning + GRPO-style grouped advantages on a small env. Intended as the quickest end-to-end RL run; works well with 2 GPUs (1 vLLM inference, 1 training).

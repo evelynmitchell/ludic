@@ -23,12 +23,14 @@ from .algorithm import (
     make_reinforce,
     make_reinforce_baseline,
     make_grpo,
+    make_sft,
 )
 from .credit_assignment import (
     GroupNormalizedReturn,
     MonteCarloReturn,
     PerStepReward,
     EpisodicReturn,
+    ConstantCredit,
 )
 from .loss import (
     Loss,
@@ -47,6 +49,7 @@ from .checkpoint import CheckpointConfig
 from .batching import (
     RolloutEngine,
     RolloutBatchSource,
+    OfflineBatchSource,
     PipelineBatchSource,
     run_pipeline_actor,
     RequestStrategy,
@@ -56,6 +59,7 @@ from .batching import (
     make_requests_fn_from_queue,
     make_dataset_queue_requests_fn,
     make_dataset_sequence_requests_fn,
+    make_chat_template_step_to_item,
 )
 from .stats import Reducer, apply_reducers_to_records
 from .loggers import TrainingLogger, PrintLogger, RichLiveLogger
@@ -73,11 +77,13 @@ __all__ = [
     "make_reinforce",
     "make_reinforce_baseline",
     "make_grpo",
+    "make_sft",
     # Credit assignment
     "GroupNormalizedReturn",
     "MonteCarloReturn",
     "PerStepReward",
     "EpisodicReturn",
+    "ConstantCredit",
     # Losses
     "Loss",
     "ReinforceLoss",
@@ -105,6 +111,7 @@ __all__ = [
     # Batching / rollout execution
     "RolloutEngine",
     "RolloutBatchSource",
+    "OfflineBatchSource",
     "PipelineBatchSource",
     "run_pipeline_actor",
     "RequestStrategy",
@@ -114,6 +121,7 @@ __all__ = [
     "make_requests_fn_from_queue",
     "make_dataset_queue_requests_fn",
     "make_dataset_sequence_requests_fn",
+    "make_chat_template_step_to_item",
     # Stats + loggers
     "Reducer",
     "apply_reducers_to_records",

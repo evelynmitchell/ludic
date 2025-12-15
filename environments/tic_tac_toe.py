@@ -154,7 +154,7 @@ class TicTacToeEnv(SingleAgentEnv):
             return StepOutcome(
                 obs=obs,
                 reward=-1.0,
-                truncated=True,
+                truncated=False,
                 terminated=True,
                 info=info,
             )
@@ -173,7 +173,7 @@ class TicTacToeEnv(SingleAgentEnv):
             return StepOutcome(
                 obs=obs,
                 reward=-1.0,
-                truncated=True,
+                truncated=False,
                 terminated=True,
                 info=info,
             )

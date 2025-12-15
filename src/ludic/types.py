@@ -56,7 +56,9 @@ class ChatResponse:
         Canonical serialization of "training-relevant" fields into the shared `info`
         dict shape used throughout the project.
         """
-        info: Dict[str, Any] = {}
+        info: Dict[str, Any] = {
+            "completion": self.text,
+        }
         if self.prompt_token_ids is not None:
             info["prompt_token_ids"] = list(self.prompt_token_ids)
         if self.completion_token_ids is not None:

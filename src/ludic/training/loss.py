@@ -5,6 +5,7 @@ from typing import Any, Dict, Mapping, Protocol, Tuple, List
 
 import torch
 from torch import Tensor
+import torch.nn.functional as F
 
 
 Batch = Mapping[str, Tensor]
@@ -111,6 +112,73 @@ class ReinforceLoss:
             "adv_mean": float(advantages.mean().detach().cpu()),
             "adv_std": float(advantages.std(unbiased=False).detach().cpu()),
             "logp_mean": float(logp_action.mean().detach().cpu()),
+        }
+        return loss, stats
+
+
+# ---------------------------------------------------------------------------
+# Masked token-level CE (SFT-friendly)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MaskedCausalLMCrossEntropyLoss:
+    """
+    Token-level masked cross entropy over the "action" region.
+
+    This is the standard SFT objective when you have (prompt, completion)
+    and want to train only on the completion tokens.
+
+    Expects:
+      - batch["input_ids"]:   [B, T]
+      - batch["action_mask"]: [B, T] 0/1 mask where 1 marks completion tokens
+      - batch["weight"]:      [B] optional per-sample weights (defaults to 1.0)
+    """
+
+    length_normalize: bool = True
+
+    def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+        input_ids = batch["input_ids"]  # [B, T]
+        action_mask = batch["action_mask"]  # [B, T]
+        weights = batch.get("weight")
+
+        if logits.ndim != 3:
+            raise ValueError(f"Expected logits [B, T, V], got {tuple(logits.shape)}")
+        if input_ids.shape != logits.shape[:2]:
+            raise ValueError(f"Shape mismatch: input_ids {input_ids.shape} vs logits {logits.shape}")
+
+        if logits.size(1) < 2:
+            raise ValueError("Sequence too short to compute next-token loss.")
+
+        # Shift for causal LM: logits[t] predicts input_ids[t+1]
+        logits_shifted = logits[:, :-1, :].float()  # [B, T-1, V]
+        targets = input_ids[:, 1:]  # [B, T-1]
+        mask = action_mask[:, 1:].to(dtype=torch.float32)  # [B, T-1]
+
+        B, Tm1, V = logits_shifted.shape
+        per_token_nll = F.cross_entropy(
+            logits_shifted.reshape(B * Tm1, V),
+            targets.reshape(B * Tm1),
+            reduction="none",
+        ).reshape(B, Tm1)
+
+        token_counts = mask.sum(dim=-1).clamp(min=1.0)  # [B]
+        per_sample_nll = (per_token_nll * mask).sum(dim=-1)  # [B]
+        if self.length_normalize:
+            per_sample_nll = per_sample_nll / token_counts
+
+        if weights is not None:
+            loss = (per_sample_nll * weights.to(per_sample_nll.dtype)).mean()
+        else:
+            loss = per_sample_nll.mean()
+
+        # Stats for parity with ReinforceLoss
+        per_sample_logp = -per_sample_nll
+        stats: Dict[str, Any] = {
+            "loss": float(loss.detach().cpu()),
+            "logp_mean": float(per_sample_logp.mean().detach().cpu()),
+            "nll_mean": float(per_sample_nll.mean().detach().cpu()),
+            "avg_action_tokens": float(token_counts.mean().detach().cpu()),
         }
         return loss, stats
 

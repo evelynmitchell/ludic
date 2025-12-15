@@ -86,6 +86,7 @@ def main():
     parser.add_argument("--eval-concurrency", type=int, default=64)
     parser.add_argument("--eval-temperature", type=float, default=0.0, help="Sampling temperature for eval passes.")
     parser.add_argument("--rollout-log", type=str, default="gsm8k_train_rollouts.jsonl")
+    parser.add_argument("--final-save", action="store_true", help="Save a final checkpoint after training completes.")
     args = parser.parse_args()
 
     rollout_log_path = os.path.abspath(args.rollout_log)
@@ -279,6 +280,13 @@ def main():
         trainer.train_sync(args.train_steps)
     except RequestsExhausted:
         print("No more training samples; stopping.")
+
+    if args.final_save:
+        try:
+            ckpt_path = trainer.save_checkpoint(metadata={"final": True})
+            print(f"Final checkpoint saved to: {ckpt_path}")
+        except RuntimeError:
+            pass  # No checkpointer configured
 
 
 if __name__ == "__main__":

@@ -46,20 +46,23 @@ TICTACTOE_REDUCERS: Dict[str, Reducer] = {
 
 def make_requests(episodes: int, args: argparse.Namespace) -> List[RolloutRequest]:
     sargs = sampling_args_from_cli(args)
-    return [
-        RolloutRequest(
-            env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": True}),
-            protocol=ProtocolSpec(kind="single_agent"),
-            seed=seed,
-            sampling_args={
-                **sargs,
-                "extras": {"extra_body": {"return_token_ids": True}},
-            },
-            num_episodes=1,
-            meta={"seed": seed},
+    start_flags = [True] * ((episodes + 1) // 2) + [False] * (episodes // 2)
+    requests: List[RolloutRequest] = []
+    for seed, agent_starts in enumerate(start_flags):
+        requests.append(
+            RolloutRequest(
+                env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": agent_starts}),
+                protocol=ProtocolSpec(kind="single_agent"),
+                seed=seed,
+                sampling_args={
+                    **sargs,
+                    "extras": {"extra_body": {"return_token_ids": True}},
+                },
+                num_episodes=1,
+                meta={"seed": seed, "agent_starts": agent_starts},
+            )
         )
-        for seed in range(episodes)
-    ]
+    return requests
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -67,13 +70,19 @@ def make_parser() -> argparse.ArgumentParser:
     add_common_eval_args(parser)
     parser.add_argument("--episodes", type=int, default=200, help="Number of episodes.")
     parser.set_defaults(temperature=0.6, max_tokens=250, max_steps=5, out="tictactoe_eval.jsonl")
-    parser.add_argument("--truncate-cot", action="store_true", help="Use TruncatedThinkingContext to collapse <think>...</think> in the prompt.")
+    parser.add_argument(
+        "--ctx",
+        choices=["full", "truncated"],
+        default="full",
+        help="Context strategy: 'full' (FullDialog) or 'truncated' (TruncatedThinkingContext).",
+    )
     return parser
 
 
 def main() -> None:
     parser = make_parser()
     args = parser.parse_args()
+    ctx_choice = args.ctx
 
     base_env = TicTacToeEnv(agent_starts=True)
     system_prompt = (
@@ -86,13 +95,16 @@ def main() -> None:
         client = VLLMChatClient(host=args.host, port=args.port, enable_weight_updates=False)
         ctx_factory = (
             (lambda sp: TruncatedThinkingContext(system_prompt=sp))
-            if args.truncate_cot
+            if ctx_choice == "truncated"
             else (lambda sp: FullDialog(system_prompt=sp))
         )
         engine = build_single_agent_engine(
             client=client,
             model=args.model,
-            parser=compose_parsers(think_prefix_parser, xml_tag_parser("move", exact=True)),
+            parser=compose_parsers(
+                lambda raw: think_prefix_parser(raw, success_reward=0.0, error_reward=-1.0),
+                lambda _: xml_tag_parser("move", exact=True, success_reward=0.0, error_reward=-1.0)(_),
+            ),
             env_registry={"tictactoe": lambda agent_starts=True: TicTacToeEnv(agent_starts=agent_starts)},
             system_prompt=system_prompt,
             context_factory=ctx_factory,

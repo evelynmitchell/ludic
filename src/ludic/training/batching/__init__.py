@@ -1,5 +1,6 @@
 from .rollout_engine import RolloutEngine
 from .synced_batching import RolloutBatchSource
+from .offline import OfflineBatchSource, make_chat_template_step_to_item
 try:
     from .pipeline import PipelineBatchSource, run_pipeline_actor
 except ImportError:
@@ -7,8 +8,8 @@ except ImportError:
     PipelineBatchSource = None  # type: ignore
     run_pipeline_actor = None  # type: ignore
 from .intra_batch_control import (
-    RequestStrategy, 
-    IdentityStrategy, 
+    RequestStrategy,
+    IdentityStrategy,
     GRPORequestStrategy
 )
 from .requests_from_dataset import (
@@ -21,6 +22,7 @@ from .requests_from_dataset import (
 __all__ = [
     "RolloutEngine",
     "RolloutBatchSource",
+    "OfflineBatchSource",
     "PipelineBatchSource",
     "run_pipeline_actor",
     "RequestStrategy",
@@ -30,4 +32,5 @@ __all__ = [
     "make_requests_fn_from_queue",
     "make_dataset_queue_requests_fn",
     "make_dataset_sequence_requests_fn",
+    "make_chat_template_step_to_item",
 ]

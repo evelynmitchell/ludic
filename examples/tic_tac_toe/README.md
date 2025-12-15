@@ -2,24 +2,105 @@
 
 Small end-to-end RL run that fine-tunes a model with LoRA on a toy Tic-Tac-Toe env using grouped advantages (GRPO-style). Assumes 2 GPUs: GPU0 for vLLM inference, GPU1 for training.
 
-## 1) Start vLLM (GPU0)
+## Pre-trained Model
+
+We provide [`hallerite/Qwen2.5-7B-TTT`](https://huggingface.co/hallerite/Qwen2.5-7B-TTT), a cold-start checkpoint created via:
+
+1. **Rejection sampling**: Used `generate_synth_data.py` to generate episodes with `Qwen/Qwen2.5-7B-Instruct`, filtered to 1124 winning trajectories (see `data/tictactoe_sft_train_data.jsonl`)
+2. **SFT**: Trained for 25 steps with effective batch size 32 (batch_size=4 × grad_accum=2 × world_size=2)
+
+This model understands the `<think>...</think><move>...</move>` format and the `[TRUNCATED]` convention used by `TruncatedThinkingContext`.
+
+## Quick Start (RL from Pre-trained)
+
+### 1) Start vLLM (GPU0)
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python -m ludic.inference.vllm_server \
-  --model Qwen/Qwen2.5-7B-Instruct
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. uv run python -m ludic.inference.vllm_server \
+  --model hallerite/Qwen2.5-7B-TTT
 ```
 
-## 2) Train (GPU1)
+### 2) Train (GPU1)
 ```bash
 CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/tic_tac_toe/train_tic_tac_toe.py \
-  --model Qwen/Qwen2.5-7B-Instruct
+  --ctx truncated
 ```
 - Uses `GRPORequestStrategy` + `GroupNormalizedReturn`, LoRA on the HF model, and a strict `<think>...</think><move>...</move>` parser.
+- Samples 50/50 agent_starts=True/False so the policy practices both as first and second player.
+- Use `--final-save` to force a final checkpoint at the end of training (in addition to periodic saves).
 - Tweak `--group-size`, `--concurrency`, `--train-steps`, `--train-temperature`, `--batch-size`, and `--max-steps-per-episode` as needed.
 
-## 3) Evaluate (optional)
+### 3) Evaluate (optional)
 ```bash
 PYTHONPATH=. uv run python examples/tic_tac_toe/eval_tic_tac_toe_vllm.py \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --episodes 200 --temperature 0.6 --max-tokens 250
+  --model hallerite/Qwen2.5-7B-TTT \
+  --start-server \
+  --episodes 200 \
+  --ctx truncated
 ```
 - Reports win/loss/draw/illegal/parse-error rates; writes `tictactoe_eval.jsonl` by default.
+
+---
+
+## Training from Scratch (Cold-Start with SFT)
+
+If you want to create your own cold-start checkpoint from `Qwen/Qwen2.5-7B-Instruct`:
+
+### 1) Generate synthetic data
+```bash
+PYTHONPATH=. uv run python examples/tic_tac_toe/generate_synth_data.py \
+  --episodes 5000 \
+  --output data/tictactoe_sft_train_data.jsonl
+```
+- Generates rollouts using `FullDialog` (model sees full thinking history)
+- Filters to keep only wins
+- Transforms `prev_obs` to have `[TRUNCATED]` placeholders (simulates what RL will show)
+- Action (model's response) kept intact
+
+Use `--no-transform` to keep raw format (for SFT without truncation).
+
+### 2) SFT on the data
+```bash
+PYTHONPATH=. uv run torchrun --nproc_per_node=2 examples/tic_tac_toe/sft_tic_tac_toe.py \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --data data/tictactoe_sft_train_data.jsonl \
+  --epochs 1 \
+  --batch-size 4 \
+  --grad-accum 2
+```
+- Uses `OfflineBatchSource` + `make_sft()` (uniform weight NLL)
+- Checkpoints saved to `checkpoints_tictactoe_fsdp2/`
+
+### 3) Push to Hub (optional)
+```bash
+python scripts/push_to_hub.py \
+  checkpoints_tictactoe_fsdp2/step_000025 \
+  your-username/your-model-name \
+  --base-model Qwen/Qwen2.5-7B-Instruct
+```
+
+### 4) RL with TruncatedThinkingContext
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/tic_tac_toe/train_tic_tac_toe.py \
+  --model your-username/your-model-name \
+  --ctx truncated
+```
+- Model now understands the `[TRUNCATED]` convention
+- RL refines strategy while keeping context compact
+
+---
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `train_tic_tac_toe.py` | Online RL training (GRPO + LoRA) |
+| `eval_tic_tac_toe_vllm.py` | Evaluate win/loss/draw rates |
+| `generate_synth_data.py` | Generate & filter winning trajectories for SFT |
+| `sft_tic_tac_toe.py` | Offline SFT on pre-generated data (FSDP2) |
+
+## Context Strategies
+
+- `--ctx full` (default): `FullDialog` - model sees complete history including full `<think>` blocks
+- `--ctx truncated`: `TruncatedThinkingContext` - previous thinking replaced with `[TRUNCATED]`, saves context length
+
+Use `--ctx truncated` after SFT cold-start for best results.

@@ -181,6 +181,23 @@ def test_group_normalized_return_handles_zero_std_dev():
     assert len(weights) == 2
 
 
+def test_group_normalized_return_positive_only_clips_negatives():
+    """
+    Tests that positive_only clips negative advantages to zero (no punishment).
+    """
+    r1 = _make_rollout("r1", prompt="prompt_A", rewards=[1.0], group_id="group_A")
+    r2 = _make_rollout("r2", prompt="prompt_A", rewards=[0.0], group_id="group_A")
+
+    assigner = GroupNormalizedReturn(group_size=2, normalize_adv=False, positive_only=True)
+    weights = assigner.compute([r1, r2])
+
+    # Rewards [1.0, 0.0] -> baseline 0.5 -> raw advantages [0.5, -0.5]
+    # positive_only -> [0.5, 0.0]
+    assert weights[("r1", 0)] == pytest.approx(0.5)
+    assert weights[("r2", 0)] == pytest.approx(0.0)
+    assert len(weights) == 2
+
+
 def test_group_normalized_return_requires_group_id():
     """
     Tests that missing group_id raises a clear error.

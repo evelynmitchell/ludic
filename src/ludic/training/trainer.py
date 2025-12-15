@@ -152,7 +152,7 @@ class Trainer:
         model: nn.Module,
         algo: RLAlgorithm,
         batch_source: BatchSource,
-        publisher: PolicyPublisher,
+        publisher: Optional[PolicyPublisher] = None,
         cfg: TrainerConfig = TrainerConfig(),
         param_filter: Optional[Callable[[str, Tensor], bool]] = None,
         enable_gradient_checkpointing: bool = False,
@@ -178,7 +178,8 @@ class Trainer:
                 This is where rollouts, replay, branching, curricula live.
 
             publisher:
-                Abstract interface to push weights to inference workers.
+                Abstract interface to push weights to inference workers. If None, weight
+                syncing is disabled.
 
             cfg:
                 TrainerConfig for device, optimizer hyperparams, pad_token_id,
@@ -228,7 +229,9 @@ class Trainer:
         self.algo = algo
         self.publisher = publisher
         self._batch_source = batch_source
-        self.sync_every_steps = self.cfg.sync_every_steps
+        self.sync_every_steps = (
+            self.cfg.sync_every_steps if self.cfg.sync_every_steps and self.cfg.sync_every_steps > 0 else None
+        )
         self.param_filter = param_filter
         self._train_step_idx = 0
         self._last_train_stats: Dict[str, float] = {}
@@ -236,7 +239,9 @@ class Trainer:
         self._checkpointer = checkpointer or (
             CheckpointManager(checkpoint_config) if checkpoint_config is not None else None
         )
+        self._resume_from = resume_from
         self.evaluator = evaluator
+        self._validate_invariants()
 
         # ---- Gradient Checkpointing Setup ----------------------------
         if enable_gradient_checkpointing:
@@ -320,6 +325,24 @@ class Trainer:
         *,
         device: torch.device,
     ) -> Dict[str, float]:
+        """
+        All-reduce stats across distributed ranks.
+
+        Implementation notes:
+        1. We batch all stats into a single tensor per reduction op (SUM or MAX)
+           rather than calling all_reduce on individual scalars. NCCL has known
+           issues with 0-dim tensors that can produce garbage values.
+
+        2. We sort keys alphabetically before building the tensor to ensure
+           consistent ordering across ranks. Different ranks may have different
+           dict iteration orders, which would cause value misalignment in the
+           all_reduce if not sorted.
+
+        Stats handling:
+        - gpu_* keys: reduced with MAX (peak memory stats)
+        - sum_keys (num_samples, etc.): reduced with SUM (counts)
+        - all other keys: reduced with SUM then divided by world_size (averages)
+        """
         if not self.cfg.reduce_stats_across_ranks:
             return stats
         if not (dist.is_available() and dist.is_initialized()):
@@ -333,20 +356,30 @@ class Trainer:
         }
         reduced: Dict[str, float] = {}
 
-        for k, v in stats.items():
-            if not isinstance(v, (int, float)):
-                continue
-            t = torch.tensor(float(v), device=device, dtype=torch.float32)
-            if k.startswith("gpu_"):
-                dist.all_reduce(t, op=dist.ReduceOp.MAX)
-                reduced[k] = float(t.item())
-                continue
+        # Separate keys into gpu (MAX) and non-gpu (SUM) groups
+        # Sort keys to ensure consistent ordering across ranks
+        gpu_keys = sorted([k for k in stats if k.startswith("gpu_") and isinstance(stats[k], (int, float))])
+        sum_reduce_keys = sorted([k for k in stats if not k.startswith("gpu_") and isinstance(stats[k], (int, float))])
 
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            if k in sum_keys:
-                reduced[k] = float(t.item())
-            else:
-                reduced[k] = float(t.item()) / float(world_size)
+        gpu_vals = [float(stats[k]) for k in gpu_keys]
+        sum_reduce_vals = [float(stats[k]) for k in sum_reduce_keys]
+
+        # Batch all_reduce for SUM keys
+        if sum_reduce_vals:
+            t_sum = torch.tensor(sum_reduce_vals, dtype=torch.float32, device=device)
+            dist.all_reduce(t_sum, op=dist.ReduceOp.SUM)
+            for i, k in enumerate(sum_reduce_keys):
+                if k in sum_keys:
+                    reduced[k] = float(t_sum[i].item())
+                else:
+                    reduced[k] = float(t_sum[i].item()) / float(world_size)
+
+        # Batch all_reduce for MAX keys (gpu stats)
+        if gpu_vals:
+            t_max = torch.tensor(gpu_vals, dtype=torch.float32, device=device)
+            dist.all_reduce(t_max, op=dist.ReduceOp.MAX)
+            for i, k in enumerate(gpu_keys):
+                reduced[k] = float(t_max[i].item())
 
         # Preserve the local step counter
         reduced["train_step"] = float(self._train_step_idx)
@@ -596,7 +629,7 @@ class Trainer:
         self._train_step_idx += 1
 
         # ---- 5) Push policy update into runtime ------------------------
-        if self._train_step_idx % self.sync_every_steps == 0:
+        if self.sync_every_steps and self.publisher is not None and self._train_step_idx % self.sync_every_steps == 0:
             self._push_weights_to_runtime()
 
         # ---- 6) Enrich stats -------------------------------------------
@@ -625,6 +658,77 @@ class Trainer:
                 logger.exception("Stats logger failed at step %s", self._train_step_idx)
 
         return final_stats
+
+    # ------------------------------------------------------------------
+    # Invariants / validation
+    # ------------------------------------------------------------------
+
+    def _validate_invariants(self) -> None:
+        """
+        Fail fast on unsupported configurations.
+        """
+        if self.sync_every_steps and self.publisher is None:
+            raise ValueError(
+                "Trainer requires a PolicyPublisher when sync_every_steps > 0. "
+                "Set sync_every_steps=0 (or None) to disable runtime syncing."
+            )
+        if (self.cfg.eval_at_start or (self.cfg.eval_every_n_steps is not None and self.cfg.eval_every_n_steps > 0)) and self.evaluator is None:
+            raise ValueError(
+                "Trainer evaluation requested (eval_at_start or eval_every_n_steps) but no evaluator was provided."
+            )
+        if self.cfg.pad_token_id is None:
+            raise ValueError("TrainerConfig.pad_token_id must be set for collation.")
+        if self.cfg.grad_accum_steps < 1:
+            raise ValueError("TrainerConfig.grad_accum_steps must be >= 1.")
+        if self._resume_from is not None and self._checkpointer is None:
+            raise ValueError("resume_from requires a CheckpointManager or checkpoint_config.")
+
+    # ------------------------------------------------------------------
+    # Public checkpoint API
+    # ------------------------------------------------------------------
+
+    def save_checkpoint(
+        self,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Path]:
+        """
+        Force an immediate checkpoint save.
+
+        This is the public API for saving checkpoints outside the automatic
+        periodic saves. Useful for final checkpoints or manual save points.
+
+        Args:
+            metadata: Optional dict of extra metadata to include in the checkpoint.
+
+        Returns:
+            Path to the saved checkpoint directory, or None if no checkpointer
+            is configured or if not on the primary rank.
+
+        Raises:
+            RuntimeError: If no CheckpointManager is configured.
+        """
+        if self._checkpointer is None:
+            raise RuntimeError(
+                "Cannot save checkpoint: no CheckpointManager configured. "
+                "Pass checkpoint_config to Trainer to enable checkpointing."
+            )
+
+        merged_meta = {"algorithm": self.algo.name}
+        if metadata:
+            merged_meta.update(metadata)
+
+        return self._checkpointer.save(
+            self.model,
+            optimizer=self.optimizer,
+            step=self._train_step_idx,
+            metadata=merged_meta,
+        )
+
+    @property
+    def current_step(self) -> int:
+        """Current training step index (read-only)."""
+        return self._train_step_idx
 
     # ------------------------------------------------------------------
     # Sync wrappers for non-async callers
@@ -788,6 +892,8 @@ class Trainer:
         Merge -> Publish -> Unmerge pattern so vLLM receives dense weights
         but training continues on adapters.
         """
+        if self.publisher is None:
+            return
         # Helper to get the underlying model if wrapped in FSDP2
         inner_model = self.model
 

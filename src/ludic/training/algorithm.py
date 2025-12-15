@@ -13,8 +13,9 @@ from ludic.training.loss import (
     ReinforceBaselineLoss,
     ClippedSurrogateLoss,
     selective_log_softmax,
+    MaskedCausalLMCrossEntropyLoss,
 )
-from ludic.training.credit_assignment import MonteCarloReturn, GroupNormalizedReturn
+from ludic.training.credit_assignment import MonteCarloReturn, GroupNormalizedReturn, ConstantCredit
 
 
 Batch = Mapping[str, Tensor]
@@ -282,6 +283,7 @@ def make_grpo(
     *,
     group_size: int,
     group_normalize_adv: bool = True,
+    positive_only: bool = False,
     clip_eps: float = 0.2,
     length_normalize: bool = False,
     name: str = "grpo",
@@ -299,6 +301,7 @@ def make_grpo(
     Args:
         group_size: Number of rollouts per group.
         group_normalize_adv: Whether to normalize advantages within each group.
+        positive_only: If True, clip negative advantages to zero (reinforce-only).
         clip_eps: PPO clipping epsilon for the surrogate objective.
         length_normalize: Whether to normalize log-probs by action length.
         name: Algorithm name for logging/metrics.
@@ -312,6 +315,7 @@ def make_grpo(
     credit_assigner: CreditAssigner = GroupNormalizedReturn(
         group_size=group_size,
         normalize_adv=group_normalize_adv,
+        positive_only=positive_only,
     )
     loss: Loss = ClippedSurrogateLoss(clip_eps=clip_eps, length_normalize=length_normalize)
     preprocess = make_old_logprob_preprocessor(backfill_chunk_size=backfill_chunk_size)
@@ -321,4 +325,56 @@ def make_grpo(
         credit_assigner=credit_assigner,
         loss=loss,
         preprocess=preprocess,
+    )
+
+
+# ---------------------------------------------------------------------------
+# SFT (Supervised Fine-Tuning / Behavioral Cloning)
+# ---------------------------------------------------------------------------
+
+
+def make_sft(
+    *,
+    length_normalize: bool = False,
+    name: str = "sft",
+) -> RLAlgorithm:
+    """
+    Supervised Fine-Tuning (SFT) / Behavioral Cloning.
+
+    This is offline RL with trivial credit assignment:
+      - Credit assignment: constant weight=1.0 for all steps
+      - Loss: ReinforceLoss (which with uniform weights is just NLL)
+
+    SFT treats all actions in the dataset equally, making it suitable for:
+      - Cold-start training on rejection-sampled successful trajectories
+      - Behavioral cloning from expert demonstrations
+      - Pre-training before RL fine-tuning
+
+    Args:
+        length_normalize: If True, normalize log-probs by action length.
+            This prevents the loss from being dominated by long sequences.
+        name: Algorithm name for logging/metrics.
+
+    Usage with OfflineBatchSource:
+        ```python
+        from ludic.training import OfflineBatchSource, Trainer, make_sft
+
+        algo = make_sft()
+        batch_source = OfflineBatchSource(
+            jsonl_paths=[Path("data/winners.jsonl")],
+            tokenize=tokenizer.encode,
+            credit_assigner=algo.credit_assigner,
+            batch_size=32,
+        )
+        trainer = Trainer(model=model, algorithm=algo, ...)
+        ```
+    """
+    credit_assigner: CreditAssigner = ConstantCredit(value=1.0)
+    # Use standard token-level CE over the action region for stability.
+    loss: Loss = MaskedCausalLMCrossEntropyLoss(length_normalize=length_normalize)
+
+    return RLAlgorithm(
+        name=name,
+        credit_assigner=credit_assigner,
+        loss=loss,
     )

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from functools import partial
 from typing import List, Dict, Any
 
 import torch
@@ -21,7 +22,7 @@ from peft import get_peft_model, LoraConfig, TaskType
 
 from environments.tic_tac_toe import TicTacToeEnv
 from ludic.agent import Agent
-from ludic.context import FullDialog
+from ludic.context import FullDialog, TruncatedThinkingContext
 from ludic.inference import VLLMChatClient
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.distributed.adapters import create_vllm_publisher
@@ -44,7 +45,11 @@ from ludic.training import (
 from ludic.training import Reducer, RichLiveLogger
 
 # STRICT: require <think>...</think> then exactly one <move>...</move>.
-TICTACTOE_PARSER = compose_parsers(think_prefix_parser, xml_tag_parser("move", exact=True))
+# Success reward is set to 0.0 so multiple turns do not gain extra parser reward.
+TICTACTOE_PARSER = compose_parsers(
+    partial(think_prefix_parser, success_reward=0.0, error_reward=-1.0),
+    xml_tag_parser("move", exact=True, success_reward=0.0, error_reward=-1.0),
+)
 
 
 def build_requests_fn(
@@ -54,15 +59,20 @@ def build_requests_fn(
 ):
     def _fn() -> List[RolloutRequest]:
         reqs: List[RolloutRequest] = []
-        for _ in range(batch_size):
+        # 50/50 split between agent starting first vs second.
+        start_flags = [True] * ((batch_size + 1) // 2) + [False] * (batch_size // 2)
+        perm = torch.randperm(len(start_flags), generator=rng).tolist()
+        for idx in perm:
+            agent_starts = bool(start_flags[idx])
             seed = int(torch.randint(0, 2**31 - 1, (1,), generator=rng).item())
             reqs.append(
                 RolloutRequest(
-                    env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": True}),
+                    env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": agent_starts}),
                     protocol=ProtocolSpec(kind="single_agent", kwargs={}),
                     num_episodes=1,
                     seed=int(seed),
                     sampling_args=sampling_args,
+                    meta={"agent_starts": agent_starts},
                 )
             )
         return reqs
@@ -72,16 +82,16 @@ def build_requests_fn(
 
 def main():
     parser = argparse.ArgumentParser(description="Train a model on Tic-Tac-Toe using Ludic + vLLM.")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--model", default="hallerite/Qwen2.5-7B-TTT")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--seed", type=int, default=0, help="Base RNG seed for sampling episode seeds.")
-    parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--concurrency", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=1, help="Rollout requests per batch source call.")
-    parser.add_argument("--train-steps", type=int, default=100, help="Number of trainer steps.")
+    parser.add_argument("--train-steps", type=int, default=30, help="Number of trainer steps.")
     parser.add_argument("--max-steps-per-episode", type=int, default=5)
-    parser.add_argument("--group-size", type=int, default=4, help="Group size for grouped advantages (GRPO-style).")
-    parser.add_argument("--lora-rank", type=int, default=6, help="LoRA rank (RL-friendly defaults from LoRA best-practice guides).")
+    parser.add_argument("--group-size", type=int, default=8, help="Group size for grouped advantages (GRPO-style).")
+    parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank (RL-friendly defaults from LoRA best-practice guides).")
     parser.add_argument(
         "--lora-alpha-mult",
         type=float,
@@ -96,6 +106,14 @@ def main():
     parser.add_argument("--eval-concurrency", type=int, default=32)
     parser.add_argument("--eval-temperature", type=float, default=0.6, help="Sampling temperature for eval passes.")
     parser.add_argument("--rollout-log", type=str, default="tictactoe_train_rollouts.jsonl")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_tictactoe", help="Checkpoint output directory.")
+    parser.add_argument("--checkpoint-every", type=int, default=10, help="Checkpoint every N steps (0 to disable).")
+    parser.add_argument("--max-to-keep", type=int, default=2, help="Max checkpoints to keep.")
+    parser.add_argument("--ctx", choices=["full", "truncated"], default="full",
+                        help="Context strategy: 'full' (FullDialog) or 'truncated' (TruncatedThinkingContext)")
+    parser.add_argument("--final-save", action="store_true", help="Save a final checkpoint after training completes.")
+    parser.add_argument("--positive-only", action="store_true", help="Only learn from positive advantages; clip negative ones to 0.")
+
     args = parser.parse_args()
 
     rollout_log_path = os.path.abspath(args.rollout_log)
@@ -137,18 +155,23 @@ def main():
     # Registries
     env_registry = {"tictactoe": lambda agent_starts=True: TicTacToeEnv(agent_starts=agent_starts)}
 
+    # Extend the env's suggested system prompt with explicit CoT + XML move instructions.
+    base_prompt = TicTacToeEnv().suggested_sysprompt or ""
+    system_prompt = (
+        base_prompt
+        + "\n\nThink through the board in <think>...</think>. After </think>, output exactly one XML tag of the form <move>A1</move> and nothing else."
+    )
+
     def protocol_factory():
-        # Extend the env's suggested system prompt with explicit CoT + XML move instructions.
-        base_prompt = TicTacToeEnv().suggested_sysprompt or ""
-        prompt = (
-            base_prompt
-            + "\n\nThink through the board in <think>...</think>. After </think>, output exactly one XML tag of the form <move>A1</move> and nothing else."
-        )
+        if args.ctx == "truncated":
+            ctx = TruncatedThinkingContext(system_prompt=system_prompt)
+        else:
+            ctx = FullDialog(system_prompt=system_prompt)
         return SingleAgentSyncProtocol(
             agent=Agent(
                 client=client,
                 model=args.model,
-                ctx=FullDialog(system_prompt=prompt),
+                ctx=ctx,
                 parser=TICTACTOE_PARSER,
             ),
             stop_on_parse_error=True,
@@ -159,7 +182,11 @@ def main():
     # Algorithm
     algo = RLAlgorithm(
         name="grpo",
-        credit_assigner=GroupNormalizedReturn(group_size=args.group_size, normalize_adv=True),
+        credit_assigner=GroupNormalizedReturn(
+            group_size=args.group_size,
+            normalize_adv=True,
+            positive_only=args.positive_only,
+        ),
         loss=ReinforceLoss(length_normalize=True),
     )
 
@@ -191,7 +218,7 @@ def main():
     # Trainer
     cfg = TrainerConfig(
         model_device="cuda" if torch.cuda.is_available() else "cpu",
-        grad_accum_steps=4,
+        grad_accum_steps=6,
         max_grad_norm=0.5,
         pad_token_id=tokenizer.pad_token_id,
         lr=5e-5,
@@ -201,9 +228,9 @@ def main():
         eval_max_steps=args.max_steps_per_episode,
     )
     checkpoint_cfg = CheckpointConfig(
-        output_dir="checkpoints_tictactoe",
-        every_n_steps=25,
-        max_to_keep=2,
+        output_dir=args.checkpoint_dir,
+        every_n_steps=args.checkpoint_every,
+        max_to_keep=args.max_to_keep,
         save_optimizer=True,
     )
     reducers = {
@@ -312,7 +339,7 @@ def main():
                 engine=RolloutEngine(env_registry=env_registry, protocol_registry=protocol_registry),
                 requests_fn=lambda: [
                     RolloutRequest(
-                        env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": True}),
+                        env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": agent_starts}),
                         protocol=ProtocolSpec(kind="single_agent", kwargs={}),
                         num_episodes=1,
                         seed=int(seed),
@@ -321,9 +348,11 @@ def main():
                             "max_tokens": 250,
                             "extras": {"extra_body": {"return_token_ids": True}},
                         },
-                        meta={"eval_seed": seed},
+                        meta={"eval_seed": seed, "agent_starts": agent_starts},
                     )
-                    for seed in range(args.eval_episodes)
+                    for seed, agent_starts in enumerate(
+                        [True] * ((args.eval_episodes + 1) // 2) + [False] * (args.eval_episodes // 2)
+                    )
                 ],
                 reducers=eval_reducers,
                 max_steps=cfg.eval_max_steps,
@@ -333,6 +362,11 @@ def main():
         ),
     )
     trainer.train_sync(args.train_steps)
+    if args.final_save:
+        try:
+            trainer.save_checkpoint(metadata={"final": True})
+        except RuntimeError:
+            pass  # No checkpointer configured
 
 
 if __name__ == "__main__":

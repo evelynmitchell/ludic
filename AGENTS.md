@@ -90,12 +90,14 @@ Instead, Ludic is closer to **classical RL** – specifically policy-gradient me
 
 - **Batch sources (trainer talks to these, not the engine)**: `src/ludic/training/types.py`
   - Sync: `src/ludic/training/batching/synced_batching.py` (`RolloutBatchSource`)
+  - Offline/SFT: `src/ludic/training/batching/offline.py` (`OfflineBatchSource`) – reads pre-collected rollouts from JSONL for SFT/offline RL.
   - Pipeline/Redis: `src/ludic/training/batching/pipeline.py` (`PipelineBatchSource`, `run_pipeline_actor`)
   - Curriculum builder: `src/ludic/training/batching/requests_from_dataset.py` (`make_requests_fn_from_queue()`) builds rollout requests from queued dataset items.
 
 - **Algorithm injection (credit + loss)**: `src/ludic/training/algorithm.py`
   - `RLAlgorithm = (CreditAssigner, Loss)`
-  - Credit assigners: `src/ludic/training/credit_assignment.py`
+  - Presets: `make_reinforce()`, `make_reinforce_baseline()`, `make_grpo()`, `make_sft()`
+  - Credit assigners: `src/ludic/training/credit_assignment.py` – `MonteCarloReturn`, `GroupNormalizedReturn`, `EpisodicReturn`, `PerStepReward`, `ConstantCredit`
   - Losses: `src/ludic/training/loss.py`
 
 - **Trainer (optimization loop only)**: `src/ludic/training/trainer.py`
@@ -132,6 +134,32 @@ GRPO mental model in this codebase:
 - It's still **policy-gradient** training on sampled tokens.
 - It avoids a learned **value function** by using a **Monte Carlo / group-relative baseline** (group mean reward for the same prompt) to form advantages.
 - If you come from PPO-RLHF: think "PPO-shaped dataflow" without a critic/value model, where the "advantage" is estimated by group comparison rather than by GAE/value bootstrapping.
+
+## SFT / Offline RL
+
+Ludic supports supervised fine-tuning (SFT) and offline RL through the same abstractions:
+
+- **SFT as offline RL**: SFT is just offline RL with `weight=1.0` for all samples.
+  - Use `make_sft()` which pairs `ConstantCredit(value=1.0)` with `ReinforceLoss`.
+  - With uniform weights, REINFORCE loss reduces to standard NLL on action tokens.
+
+- **OfflineBatchSource**: `src/ludic/training/batching/offline.py`
+  - Reads rollouts from JSONL files (e.g., output of rejection sampling).
+  - Tokenizes state/action pairs and applies credit assignment.
+  - Supports shuffling, batching, and sample filtering.
+
+- **Workflow** (cold-start training):
+  1. Generate rollouts with `RolloutEngine` or `rejection_sampling.py`.
+  2. Filter to keep successful trajectories (e.g., wins only).
+  3. Train with `OfflineBatchSource` + `make_sft()` to bootstrap the model.
+  4. Continue with online RL (`RolloutBatchSource` + `make_grpo()`) for refinement.
+
+- **AWR-style offline RL**: For advantage-weighted regression, wrap a credit assigner:
+  ```python
+  # AWR: weight = exp(advantage / temperature)
+  base_credit = GroupNormalizedReturn(group_size=G)
+  # Then transform weights via exp(w / temp) in a custom assigner
+  ```
 
 ## Evaluation System
 

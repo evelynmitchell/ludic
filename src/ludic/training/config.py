@@ -35,7 +35,8 @@ class TrainerConfig:
           
     - sync_every_steps:
           Frequency (in macro-steps) at which to push updated policy 
-          weights to the Agent's runtime (e.g., vLLM).
+          weights to the Agent's runtime (e.g., vLLM). Set to 0 to disable
+          syncing (e.g., pure offline/local training).
 
     - mixed_precision_dtype:
           Optional string to configure FSDP's mixed precision policy. 
