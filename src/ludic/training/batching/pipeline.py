@@ -12,7 +12,6 @@ from ludic.training.types import (
     SAWItem, 
     RolloutRequest, 
     CreditAssigner,
-    TokenizeFn
 )
 from ludic.inference.client import VersionedClient
 from .rollout_engine import RolloutEngine
@@ -98,8 +97,6 @@ async def run_pipeline_actor(
     queue_key: str = "ludic_queue",
     max_steps: int = 10,
     concurrency: int = 4,
-    retokenize: bool = False,
-    tokenize: Optional[TokenizeFn] = None,
     client: Optional[VersionedClient] = None,
 ):
     """
@@ -150,8 +147,6 @@ async def run_pipeline_actor(
                 max_steps=max_steps,
                 credit_assigner=credit_assigner,
                 concurrency=concurrency,
-                retokenize=retokenize,
-                tokenize=tokenize
             )
         except Exception as e:
             logger.error(f"Error in actor generation loop: {e}")

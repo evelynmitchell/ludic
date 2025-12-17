@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Callable, List, Tuple, Dict, Any
 
 from ludic.agents.tool_agent import ToolAgent
-from ludic.types import SamplingArgs
+from ludic.inference.request import InferenceSpec, ToolRequest
 from ludic.parsers import ParseResult
 
 class ReActAgent(ToolAgent):
@@ -32,12 +32,14 @@ class ReActAgent(ToolAgent):
 
     async def act(
         self, 
-        sampling_args: SamplingArgs, 
+        inference: InferenceSpec | None = None,
+        sampling_seed: int | None = None,
         timeout_s: float | None = None
     ) -> Tuple[ParseResult, str, Dict[str, Any]]:
         
-        # 1. Setup Sampling Args
-        sargs = self._with_tools(sampling_args)
+        # 1. Setup inference config (tools enabled by default)
+        inf = self._with_tools(inference)
+        tools_req: ToolRequest = self._tool_request()
         last_info: Dict[str, Any] = {}
         
         # 2. ReAct Loop
@@ -50,10 +52,7 @@ class ReActAgent(ToolAgent):
             messages = self._ctx.on_before_act()
 
             if is_final_try:
-                # A. Strip tools so it CANNOT call them
-                sargs = self._strip_tools(sargs)
-                
-                # B. Force the agent to wrap up
+                # A. Force the agent to wrap up
                 # We inject a temporary "system" instruction into the prompt
                 # (Note: We don't save this to self._ctx, just for this one call)
                 messages = messages + [{
@@ -63,11 +62,16 @@ class ReActAgent(ToolAgent):
                         "You must output your final move now."
                     )
                 }]
+                tools_req_this: ToolRequest | None = None
+            else:
+                tools_req_this = tools_req
 
             # 3. Inference (shared helper)
             resp, info, last_info = await self._infer_once(
                 messages=messages,
-                sampling_args=sargs,
+                inference=inf,
+                sampling_seed=sampling_seed,
+                tools=tools_req_this,
                 timeout_s=timeout_s,
             )
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Union, Optional, TypedDict
+from typing import Any, Dict, List, Union, Optional
 import logging
 import time
 import uuid
@@ -10,18 +10,6 @@ log = logging.getLogger(__name__)
 
 JSON = Union[str, int, float, bool, None, Dict[str, Any], List[Any]]
 
-
-# ----- Agent level types -----
-
-class SamplingArgs(TypedDict, total=False):
-    seed: int
-    temperature: float
-    max_tokens: int
-    top_p: float
-    frequency_penalty: float
-    presence_penalty: float
-    stop: Union[str, List[str]]
-    extras: dict[str, Any] # for vendor-specific stuff
 
 # Chat-style message schema
 Message = Dict[str, str]  # {"role": "system|user|assistant", "content": "..."}

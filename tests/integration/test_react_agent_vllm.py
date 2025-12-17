@@ -4,6 +4,7 @@ import pytest
 from transformers import AutoTokenizer  # Only for verification
 
 from ludic.inference.vllm_client import VLLMChatClient
+from ludic.inference import InferenceSpec, SamplingParams, ReturnSpec
 from ludic.agents.react_agent import ReActAgent
 from ludic.context.full_dialog import FullDialog
 from tests._mocks import _mock_parser
@@ -65,7 +66,10 @@ async def test_react_agent_vllm_tool_call_loop(
 
     print("\n--- Starting ReAct Loop ---")
     parse_result, raw_text, info = await agent.act(
-        sampling_args={"temperature": 0.0, "max_tokens": 256}
+        inference=InferenceSpec(
+            sampling=SamplingParams(temperature=0.0, max_tokens=256),
+            return_=ReturnSpec.for_eval(return_token_ids=True),
+        )
     )
     print(f"--- Final Output ---\n{raw_text}\n--------------------")
 

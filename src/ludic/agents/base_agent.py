@@ -4,9 +4,9 @@ from typing import Any, Dict, List, Optional, Tuple, Mapping
 
 import torch
 
-from ludic.types import SamplingArgs, Observation, Info, Message, ChatResponse
+from ludic.types import Observation, Info, Message, ChatResponse
 from ludic.inference.client import ChatClient
-from ludic.inference.sampling import SamplingConfig, resolve_sampling_args
+from ludic.inference.request import ChatCompletionRequest, InferenceSpec, ToolRequest
 from ludic.context.base import ContextStrategy
 from ludic.parsers import Parser, ParseResult
 
@@ -64,21 +64,28 @@ class Agent:
         self,
         *,
         messages: List[Message],
-        sampling_args: SamplingArgs,
+        inference: Optional[InferenceSpec] = None,
+        sampling_seed: Optional[int] = None,
+        tools: Optional[ToolRequest] = None,
         timeout_s: Optional[float] = None,
     ) -> Tuple[ChatResponse, Dict[str, Any], Dict[str, Any]]:
         """
         Shared single inference helper.
 
-        Resolves sampling args, runs the client call (optionally with timeout),
+        Builds a ChatCompletionRequest, runs the client call (optionally with timeout),
         merges token IDs/logprobs into the returned info dict, and updates self.last_info.
         """
-        sampling: SamplingConfig = resolve_sampling_args(sampling_args)
-        coro = self._client.complete(
+        inf = inference or InferenceSpec()
+        req = ChatCompletionRequest(
             model=self._model,
             messages=messages,
-            sampling=sampling,
+            sampling=inf.sampling,
+            return_=inf.return_,
+            seed=sampling_seed,
+            tools=tools,
+            extensions=inf.extensions,
         )
+        coro = self._client.complete(req)
         if timeout_s is None:
             resp, client_info = await coro
         else:
@@ -107,7 +114,8 @@ class Agent:
 
     async def act(
         self,
-        sampling_args: SamplingArgs,
+        inference: Optional[InferenceSpec] = None,
+        sampling_seed: Optional[int] = None,
         timeout_s: Optional[float] = None,
     ) -> Tuple[ParseResult, str, Dict[str, Any]]:
         """
@@ -117,7 +125,8 @@ class Agent:
         agent via on_env_reset() and on_after_step().
 
         Args:
-            sampling_args: The sampling configuration for this step.
+            inference: The inference configuration for this step.
+            sampling_seed: Optional per-request seed for backend sampling.
             timeout_s: Optional timeout for the inference call.
 
         Returns:
@@ -129,7 +138,8 @@ class Agent:
         # 2. Act (run inference)
         resp, _client_info, last_info = await self._infer_once(
             messages=messages,
-            sampling_args=sampling_args,
+            inference=inference,
+            sampling_seed=sampling_seed,
             timeout_s=timeout_s,
         )
 

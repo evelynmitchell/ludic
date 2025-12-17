@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
-from ludic.types import JSON, Rollout, SamplingArgs, Step
+from ludic.types import JSON, Rollout, Step
+from ludic.inference.request import InferenceSpec
 
 
 @dataclass
@@ -68,7 +69,7 @@ class RolloutRequest:
       - protocol:
             ProtocolSpec, resolved via protocol_registry.
             
-      - sampling_args:
+      - inference:
             Passed directly to Agent via protocol.run().
 
       - num_episodes:
@@ -79,8 +80,9 @@ class RolloutRequest:
     """
     env: EnvSpec
     protocol: ProtocolSpec
-    seed: Optional[int] = None
-    sampling_args: Optional[SamplingArgs] = None
+    env_seed: Optional[int] = None
+    sampling_seed: Optional[int] = None
+    inference: Optional[InferenceSpec] = None
     num_episodes: int = 1
     meta: Dict[str, JSON] = field(default_factory=dict)
 

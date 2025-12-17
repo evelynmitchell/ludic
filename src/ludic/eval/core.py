@@ -10,7 +10,7 @@ Eval items are dicts shaped like training `SAWItem.meta` (one per step).
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 
 from ludic.training.batching.rollout_engine import RolloutEngine
 from ludic.training.stats import Reducer, apply_reducers_to_records

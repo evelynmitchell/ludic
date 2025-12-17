@@ -9,13 +9,13 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ludic.envs.env import LudicEnv
 from ludic.interaction.base import InteractionProtocol
-from ludic.types import Rollout, SamplingArgs
+from ludic.types import Rollout
+from ludic.inference.request import InferenceSpec
 
 from ludic.training.types import (
     CreditAssigner,
     SAWItem,
     SAWBatch,
-    TokenizeFn,
     RolloutRequest,
     ProtocolSpec,
     EnvSpec,
@@ -103,10 +103,6 @@ def _coerce_completion_logprobs(
     return [float(v) for v in completion_logprobs]
 
 
-def _drop_model_trace_keys(info: Mapping[str, Any]) -> Dict[str, Any]:
-    return {k: v for k, v in info.items() if k not in _TOKEN_TRACE_KEYS}
-
-
 def _base_item_meta(
     *,
     rollout: Rollout,
@@ -168,52 +164,6 @@ def _saw_item_from_model_ids(
     meta.update(step_info)
     if completion_logprobs is not None:
         meta["completion_logprobs"] = completion_logprobs
-
-    return (
-        SAWItem(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            action_mask=action_mask,
-            weight=weight,
-            meta=meta,
-        ),
-        comp_len,
-    )
-
-
-def _saw_item_from_retokenize(
-    *,
-    rollout: Rollout,
-    step_index: int,
-    reward: float,
-    weight: float,
-    prev_obs: str,
-    action: str,
-    tokenize: TokenizeFn,
-    step_info: Mapping[str, Any],
-    truncated: bool,
-    terminated: bool,
-) -> Tuple[SAWItem, int]:
-    state_ids = tokenize(prev_obs)
-    action_ids = tokenize(action)
-    comp_len = len(action_ids)
-
-    input_ids = state_ids + action_ids
-    attention_mask = [1] * len(input_ids)
-    action_mask = [0] * len(state_ids) + [1] * len(action_ids)
-
-    meta = _base_item_meta(
-        rollout=rollout,
-        step_index=step_index,
-        reward=reward,
-        comp_len=comp_len,
-        prev_obs=prev_obs,
-        action=action,
-        truncated=truncated,
-        terminated=terminated,
-        prompt_len=len(state_ids),
-    )
-    meta.update(_drop_model_trace_keys(step_info))
 
     return (
         SAWItem(
@@ -291,18 +241,23 @@ class RolloutEngine:
             # 2. Create a fresh env
             env = self._build_env(request.env)
 
-            sargs: SamplingArgs = request.sampling_args or {}
+            # 3. Determine seeds
+            run_env_seed = request.env_seed if request.env_seed is not None else episode_idx
+            is_forced_env_seed = request.env_seed is not None
+            run_sampling_seed = (
+                request.sampling_seed if request.sampling_seed is not None else episode_idx
+            )
+            is_forced_sampling_seed = request.sampling_seed is not None
 
-            # 3. Determine the seed to use for env.reset()
-            run_seed = request.seed if request.seed is not None else episode_idx
-            is_forced_seed = request.seed is not None
+            inf = request.inference or InferenceSpec()
 
             # 4. Run the episode using the fresh protocol and env
             rollouts = await protocol.run(
                 env=env,
                 max_steps=max_steps,
-                seed=run_seed,
-                sampling_args=sargs,
+                env_seed=run_env_seed,
+                sampling_seed=run_sampling_seed,
+                inference=inf,
                 timeout_s=timeout_s,
             )
 
@@ -324,8 +279,10 @@ class RolloutEngine:
                         "timeout_s": timeout_s,
                         "env_kind": request.env.kind,
                         "protocol_kind": request.protocol.kind,
-                        "used_seed": run_seed,
-                        "forced_seed": is_forced_seed,
+                        "env_seed": run_env_seed,
+                        "sampling_seed": run_sampling_seed,
+                        "forced_env_seed": is_forced_env_seed,
+                        "forced_sampling_seed": is_forced_sampling_seed,
                     }
                 )
 
@@ -409,8 +366,6 @@ class RolloutEngine:
         credit_assigner: CreditAssigner,
         timeout_s: Optional[float] = None,
         concurrency: int = 8,
-        retokenize: bool = False,
-        tokenize: Optional[TokenizeFn] = None,
         sample_filter: Optional[SampleFilter] = None,
     ) -> SAWBatch:
         """
@@ -422,21 +377,14 @@ class RolloutEngine:
         4. Optionally filters samples based on metadata.
 
         Tokenization strategy:
-        - If Step.info contains `prompt_token_ids` and `completion_token_ids`,
-          those are used *unless* retokenize=True.
-        - Otherwise, if retokenize=True, use provided tokenizer.
-        - Else raise an error.
+        - Online RL requires rollout-time token IDs:
+          Step.info must contain `prompt_token_ids` and `completion_token_ids`.
 
         Filtering:
         - If sample_filter is provided, it's applied after SAWItems are created.
         - Filter returns True to KEEP a sample, False to DROP it.
         - Use ludic.training.filters for common predicates.
         """
-        assert (not retokenize) or tokenize, (
-            "Either use a chat client that populates token IDs, "
-            "or pass a tokenizer if retokenize=True."
-        )
-
         rollouts = await self.generate_rollouts(
             requests=requests,
             max_steps=max_steps,
@@ -456,7 +404,7 @@ class RolloutEngine:
                 info = step.info or {}
                 model_ids = _extract_model_token_ids(info)
 
-                if model_ids is not None and not retokenize:
+                if model_ids is not None:
                     prompt_ids, completion_ids = model_ids
                     prompt_len = len(prompt_ids)
                     completion_logprobs = _coerce_completion_logprobs(
@@ -481,28 +429,12 @@ class RolloutEngine:
                     )
                     items_with_lengths.append((item, prompt_len, comp_len))
                 else:
-                    if not retokenize:
-                        raise ValueError(
-                            f"Missing model token IDs for rollout {r.id}, step {step.index}, "
-                            "and retokenize=False. Either enable retokenize=True or fix your "
-                            "Agent/run_episode to store 'prompt_token_ids' and "
-                            "'completion_token_ids' in Step.info."
-                        )
-                    assert tokenize is not None
-                    item, comp_len = _saw_item_from_retokenize(
-                        rollout=r,
-                        step_index=step.index,
-                        reward=reward,
-                        weight=w,
-                        prev_obs=step.prev_obs,
-                        action=step.action,
-                        tokenize=tokenize,
-                        step_info=info,
-                        truncated=step.truncated,
-                        terminated=step.terminated,
+                    raise ValueError(
+                        f"Missing rollout-time token IDs for rollout {r.id}, step {step.index}. "
+                        "Online RL batching requires Step.info['prompt_token_ids'] and "
+                        "Step.info['completion_token_ids'] (and optionally completion_logprobs). "
+                        "Fix your inference client to return token IDs."
                     )
-                    prompt_len = len(item.input_ids) - comp_len
-                    items_with_lengths.append((item, prompt_len, comp_len))
 
         # ---- Apply sample filter ------------------------------------------
         num_before_filter = len(items_with_lengths)
