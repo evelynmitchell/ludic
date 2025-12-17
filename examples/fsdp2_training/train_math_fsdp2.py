@@ -13,8 +13,8 @@ Tune batch sizes, steps, and sampling to your hardware.
 from __future__ import annotations
 
 import argparse
-import asyncio
 import logging
+import json
 import os
 import queue
 import sys
@@ -32,18 +32,17 @@ from ludic.context import FullDialog
 from ludic.inference import VLLMChatClient
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.distributed import create_vllm_publisher
-from ludic.parsers import boxed_parser, compose_parsers, think_prefix_parser, extract_last_boxed_content
+from ludic.parsers import boxed_parser, extract_last_boxed_content
 from ludic.eval import EngineEvaluator
 from ludic.training import (
-    RLAlgorithm,
     RolloutEngine,
     RolloutBatchSource,
     Trainer,
     TrainerConfig,
     CheckpointConfig,
     make_dataset_queue_requests_fn,
-    GroupNormalizedReturn,
-    ReinforceLoss,
+    make_grpo,
+    RequestsExhausted,
     RolloutRequest,
     EnvSpec,
     ProtocolSpec,
@@ -150,7 +149,7 @@ def load_math_eval(limit: int | None) -> List[Dict[str, Any]]:
             raise SystemExit(f"{MATH_EVAL_DATASET} sample is missing 'solution' at index={idx}")
         if extract_last_boxed_content(str(solution)) is None:
             raise SystemExit(
-                f"{MATH_EVAL_DATASET} sample at index={idx} does not contain a final \\\\boxed{{...}} answer"
+                f"{MATH_EVAL_DATASET} sample at index={idx} does not contain a final \\boxed{...} answer"
             )
         sample["solution"] = str(solution)
         samples.append(sample)
@@ -173,11 +172,20 @@ def main() -> None:
     parser.add_argument(
         "--system-prompt",
         type=str,
-        default="You are a careful math tutor. Think in <think></think> and put your final answer in \\\\boxed{...}.",
+        default=(
+            "Think step by step and put your final answer into \\boxed{...}."
+        ),
     )
     parser.add_argument("--rollout-log", type=str, default="fsdp2_math_rollouts.jsonl")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_math_fsdp2")
-    parser.add_argument("--eval-every", type=int, default=10, help="Eval every N train steps (0 disables).")
+    parser.add_argument(
+        "--eval-log",
+        type=str,
+        default="fsdp2_eval_metrics.jsonl",
+        help="Append eval metrics here (jsonl). Set empty to disable.",
+    )
+    parser.add_argument(
+        "--eval-every", type=int, default=10, help="Eval every N train steps (0 disables).")
     parser.add_argument("--eval-before-start", action="store_true", default=False, help="Run eval once at step 0.")
     parser.add_argument("--eval-limit", type=int, default=100, help="Number of test samples for eval (0 disables).")
     parser.add_argument("--eval-concurrency", type=int, default=32)
@@ -210,9 +218,12 @@ def main() -> None:
     torch.cuda.set_device(device)
 
     rollout_log_path = args.rollout_log.replace(".jsonl", f".rank{rank}.jsonl")
+    eval_log_path = args.eval_log if args.eval_log else None
     if rank == 0:
         os.makedirs(os.path.dirname(rollout_log_path) or ".", exist_ok=True)
         os.makedirs(args.checkpoint_dir, exist_ok=True)
+        if eval_log_path:
+            os.makedirs(os.path.dirname(eval_log_path) or ".", exist_ok=True)
     dist.barrier()
     logging.getLogger(__name__).info(
         "Initialized distributed training (world_size=%s, device=%s).", world_size, device
@@ -259,7 +270,7 @@ def main() -> None:
             fsdp.fully_shard(layer, mp_policy=mp_policy)
     fsdp.fully_shard(model, mp_policy=mp_policy)
 
-    action_parser = compose_parsers(think_prefix_parser, boxed_parser)
+    action_parser = boxed_parser
 
     # Shared client for inference (rank0 does weight updates)
     client = VLLMChatClient(
@@ -284,10 +295,12 @@ def main() -> None:
 
     protocol_registry = {"single_agent": protocol_factory}
 
-    algo = RLAlgorithm(
+    algo = make_grpo(
         name="grpo",
-        credit_assigner=GroupNormalizedReturn(normalize_adv=True),
-        loss=ReinforceLoss(length_normalize=True),
+        group_size=args.group_size,
+        group_normalize_adv=True,
+        clip_eps=0.1,
+        length_normalize=True,
     )
 
     engine = RolloutEngine(
@@ -298,7 +311,7 @@ def main() -> None:
     sampling_args = {
         "temperature": args.train_temperature,
         "max_tokens": args.max_tokens,
-        "extras": {"extra_body": {"return_token_ids": True}},
+        "extras": {"extra_body": {"return_token_ids": True, "logprobs": True, "top_logprobs": 1}},
     }
     requests_fn = make_dataset_queue_requests_fn(
         samples_q,
@@ -437,35 +450,36 @@ def main() -> None:
         ),
     )
 
-    async def train_loop():
-        if cfg.eval_at_start:
-            await trainer.eval()
+    def log_eval_metrics(step: int, metrics: Dict[str, float]) -> None:
+        if rank != 0 or not eval_log_path:
+            return
+        entry = {"step": int(step)}
+        entry.update({k: float(v) for k, v in metrics.items()})
+        try:
+            with open(eval_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception:
+            logging.getLogger(__name__).exception("Failed to write eval metrics")
 
-        for _ in range(args.train_steps):
-            local_done = 1 if samples_q.empty() else 0
-            if dist.is_initialized():
-                done = torch.tensor(local_done, device=device)
-                dist.all_reduce(done, op=dist.ReduceOp.MAX)
-                if int(done.item()) != 0:
-                    break
-            else:
-                if local_done:
-                    break
+    def train_log(stats: Dict[str, float]) -> None:
+        if rank != 0:
+            return
+        step = int(stats.get("train_step", 0))
+        print(
+            f"[rank0 step {step}] loss={stats.get('loss'):.4f} reward={stats.get('avg_total_reward'):.4f}",
+            flush=True,
+        )
 
-            stats = await trainer.train_step()
-            if rank == 0:
-                step = int(stats["train_step"])
-                print(
-                    f"[rank0 step {step}] loss={stats.get('loss'):.4f} reward={stats.get('avg_total_reward'):.4f}",
-                    flush=True,
-                )
-
-            if cfg.eval_every_n_steps:
-                step = int(stats["train_step"])
-                if step % int(cfg.eval_every_n_steps) == 0:
-                    await trainer.eval()
-
-    asyncio.run(train_loop())
+    try:
+        trainer.train_sync(
+            args.train_steps,
+            log_every=1,
+            log_fn=train_log,
+            eval_log_fn=lambda metrics: log_eval_metrics(trainer.current_step, metrics),
+        )
+    except RequestsExhausted:
+        if rank == 0:
+            print("No more training samples; stopping.")
 
     if args.final_save:
         try:
