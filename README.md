@@ -1,111 +1,97 @@
-# Ludic
-## A hackable training library for the era of experience
+# Ludic - an LLM-RL library for the era of experience
 
-This repo is the result of a full rewrite: a library (not a framework) where you can rip out parts, swap in your own, and keep the pieces loosely coupled. Training and inference stay decoupled, training runs async, and everything else is designed to be composable rather than prescriptive.
+This repo is the result of an ongoing frustration I have had for months with the state of LLM-RL. It is essentially what I wanted during a research project earlier this year, but did not have – a codebase to post-train LLMs with RL built principally with **agentic behavior** in mind, not single-step LLM reasoning. While there are, as of Dec. 2025, many other great codebases for this purpose, I still wanted to share what I have worked on in the last few months, because I believe it to be conceptually quite unique.
 
-### Why this design
-- Agent vs. Environment: envs are pure state-transition functions with optional rewards and prompts; agents own the LLM harness (prompting, context, parsing, auxiliary tools, intrinsic format rewards).
-- Episode vs. Rollout: an episode is an env run; a rollout is an agent’s perspective on that episode. Multi-agent setups get clean, per-agent rollouts via trajectory collectors.
-- InteractionProtocols: the explicit agent–env loop lives outside both, so you can rewrite how interaction works without touching agent/env code.
-- Rollouts → SAW tensors: `RolloutEngine` produces trajectories; `BatchSource` turns them into State–Action–Weight batches for the GPU.
-- Algorithms as plug-ins: the Trainer is just an optimization loop; swap credit assigners (MC return, GRPO group normalization, per-step/episodic) and losses without new trainer classes.
-- Async pipeline ready: run actors on inference nodes pushing SAWItems into Redis while the trainer on your GPU never waits for generation.
+This year, I spent a lot of time thinking about LLM-RL library design, and how the architecture would have to look like to prototype new ideas quickly and iterate on research. 
 
-### What’s here
-- Agents: base `Agent`, `ToolAgent`, and `ReActAgent`; parser utilities (`xml_tag_parser`, `think_prefix_parser`, `compose_parsers`) with intrinsic rewards/penalties for format.
-- Context: `FullDialog`, `TruncatedThinkingContext` (keeps full history while trimming `<think>...</think>` in prompts).
-- Environments: `LudicEnv` for multi-agent, `SingleAgentEnv` for gym-like single-agent; examples for QA and Tic-Tac-Toe.
-- Interaction: `SingleAgentSyncProtocol`, multi-agent loop + collectors for per-agent rollouts.
-- Rollouts & batching: `RolloutEngine`, GRPO/identity request strategies, token-aware collation into SAW batches.
-- Training: `Trainer` (FSDP-aware, grad accumulation, optional grad checkpointing), REINFORCE/baseline losses, checkpointing, reducers/loggers.
-- Inference/distribution: `VLLMChatClient` + weight publishing to the bundled `ludic.inference.vllm_server`, Redis pipeline RL (actor/trainer split), policy version tagging to reject stale data.
-- Examples: Tic-Tac-Toe GRPO + LoRA (`examples/tic_tac_toe/train_tic_tac_toe.py`), GSM8K GRPO (`examples/gsm8k/*`), FSDP2 math (`examples/fsdp2_training/*`), pipeline RL actor/trainer, rejection sampling data generation.
-- Tests: unit/integration suites (`integration`, `gpu` markers).
+After my latest research project concluded mid-November and without much to do, I decided to rewrite my entire codebase from scratch and make it public.
 
-### Status
-This is aspirational and built for researchers who want clean abstractions and hackability. It is not production-grade; expect to modify it for your own runs.
+The codebase follows some design decisions that will be very familiar to those who have already worked with other LLM-RL codebases, but radically departs from other frameworks in other aspects.
+
+Let me convince you.
+
+### Design Decisions
+
+- It's a **library** – not a *framework*. You can rip out parts and swap in your own as you please – everything is loosely coupled.
+- There is a clear separation between **Agent** and **Environment**
+	- **Environments** are pure state-transition functions which may also emit rewards on state-stransition; they are also multi-agent by design.
+	- **Agents** are LLMs with state, placed into a harness that deals with context management, parsing LLM outputs into the format the environment wants it, auxiliary tools & many other things
+	- The **Interaction Protocol** explicitly defines the agent–env loop. This allows for reusing different agent harnesses with different envs and vice versa. An `InteractionProtocol` has a method named `run()` that returns a list of **Rollouts** – one for each agent perspective.
+- The **Trainer** asks a **batch source** for the next batch by calling **batch_source.get_next_batch()**. The batch source then yields a batch of **State-Action-Weight** pairs. These are the biggest unit of data that the trainer is concerned with – they are essentially the experience that the agent gathered: the *state*, in which the agent took some *action* and the *weight* we want to attach to this action. This weight can be either the ground-truth reward or the rollout return or the group-relative advantage, among many other things. The trainer thus does not know about the concept of an episode or a rollout.
+	- The batch source can be a dataset for offline RL (like SFT) or, say, a **Rollout Engine** that is connected to a live **vLLM** server for online RL.
+- An **RL algorithm** is then just a strategy that neatly plugs into the trainer. It defines a **Credit Assigner** and a **Loss** – these two concepts are essentially all you need to define (almost) any RL algorithm.
+	- The credit assigner tells us how much credit one state-action (or prompt-completion in LLM lingo) pair receives. For GRPO, this is relative to other rollouts.
+- There are also primitives for **Intra-Batch** control and **Inter-Batch** control
+	- Intra-batch control is how the rollouts in a batch should relate to one another. For instance, GRPO is implemented as an intra-batch control mechanism that takes rollout requests and expands them such that the rollout engine receives each original rollout request `group_size`-many times.
+	- Inter-batch control is for things like curriculum learning or other concepts from classical RL that describe a dependence between batches over the course of training.
+
+### Caveat
+
+The codebase is mostly aspirational. It is built for researchers who value clean abstractions, conceptual clarity and hackability. It is neither battle-tested, nor production-grade. It does not aim to replace any other framework. It is best thought of as an intellectual exercise or a form of artistic expression – similar to functional programming.
+
+However, I have found it quite easy to extend this codebase to add new algorithms, agent harnesses or environments using Claude Code or Codex, and I find it a joy to work with. 
 
 ## Repository layout
-- `src/ludic/agents`: base `Agent`, `ToolAgent`, and `ReActAgent` (tool-calling loop).
-- `src/ludic/context`: conversation memory strategies (`FullDialog`, truncated thinking).
-- `src/ludic/envs`: environment interfaces plus `DatasetQAEnv` and `TicTacToeEnv`.
-- `src/ludic/interaction`: protocols that wire agents to envs (`SingleAgentSyncProtocol`).
-- `src/ludic/inference`: OpenAI-compatible clients (`VLLMChatClient`), sampling utilities.
-- `src/ludic/training`: RL algorithms, losses, batching (`RolloutEngine`, `RolloutBatchSource`, pipeline actor/redis queue), trainer, checkpointing, logging.
-- `environments/`: runnable example envs (Tic-Tac-Toe, GSM8K-style QA).
-- `examples/`: entry points for Tic-Tac-Toe GRPO + LoRA, GSM8K training/eval, FSDP2 math training, pipeline RL actor/trainer, and rejection sampling.
-- `tests/`: unit/integration coverage (markers: `integration`, `gpu`).
-- `scripts/`: standalone utilities (e.g., `push_to_hub.py` for uploading checkpoints to HuggingFace Hub).
 
-### Examples at a glance (what each one is for)
-- Tic-Tac-Toe (`examples/tic_tac_toe/train_tic_tac_toe.py`): LoRA fine-tuning + GRPO-style grouped advantages on a small env. Intended as the quickest end-to-end RL run; works well with 2 GPUs (1 vLLM inference, 1 training).
-- GSM8K (`examples/gsm8k/train_gsm8k.py` + `eval_gsm8k_vllm.py`): GRPO with PPO-style clip to showcase standard question-answer training. Also laid out for 2 GPUs (1 inference, 1 training).
-- FSDP2 Math (`examples/fsdp2_training/train_math_fsdp2.py`): Multi-GPU (4 GPU template: 1 vLLM, 3 training) showing FSDP2 wrapping, NCCL weight pushes, and GRPO-style credit assignment on a 7B model.
-- Pipeline RL (`examples/pipeline_rl/run_actor.py`, `run_trainer.py`): actor/learner split over Redis for async sampling.
-- Rejection sampling: `examples/rejection_sampling.py` for data generation via filtering.
+If you want to find your way around quickly, there are two main things in here: the library itself, and a set of runnable scripts that show how to use it end-to-end.
+
+- `src/ludic/`: the actual library. This is where the core abstractions live (agents + context/memory, env interfaces + built-in envs, interaction protocols, inference clients, training/batching, evaluation, and distributed weight pushing).
+- `examples/`: runnable “glue” scripts that assemble the pieces into real training/eval runs. These are meant as starting points and reference implementations.
+- `environments/`: small runnable environments and configs you can import from, or execute directly when you just want to play with an env in isolation.
+- `data/`: small datasets and artifacts used by some examples.
+- `tests/`: unit/integration tests (pytest markers include `integration` and `gpu`).
+- `scripts/`: standalone utilities (for instance `push_to_hub.py` for uploading checkpoints to the HuggingFace Hub).
+
+If you care about truncation semantics (env time limits vs protocol cutoffs vs model finish reasons), read `CONSIDERATIONS.md`.
+
+### Examples at a glance
+
+- Tic-Tac-Toe (`examples/tic_tac_toe/`): a small env that’s useful for iterating on the full stack without paying a huge sampling bill.
+	- Online RL: `examples/tic_tac_toe/train_tic_tac_toe.py` does LoRA fine-tuning with GRPO-style group-relative credit assignment.
+	- SFT: `examples/tic_tac_toe/sft_tic_tac_toe.py` is the “offline” counterpart; it’s useful if you want to bootstrap a policy (format-following, basic competence) before turning on online RL.
+	- Data + eval: `examples/tic_tac_toe/generate_synth_data.py` and `examples/tic_tac_toe/eval_tic_tac_toe_vllm.py`.
+
+- GSM8K (`examples/gsm8k/`): a more “standard” QA-shaped workload with training + evaluation scripts (`examples/gsm8k/train_gsm8k.py`, `examples/gsm8k/eval_gsm8k_vllm.py`).
+
+- FSDP2 Math (`examples/fsdp2_training/`): a multi-GPU template showing FSDP2 wrapping, NCCL weight pushes to vLLM, and GRPO-style credit assignment (`examples/fsdp2_training/train_math_fsdp2.py`).
+
+- Pipeline RL (`examples/pipeline_rl/`): an actor/learner split over Redis for async sampling (`examples/pipeline_rl/run_actor.py`, `examples/pipeline_rl/run_trainer.py`). This is still experimental.
+
+- Rejection sampling (`examples/rejection_sampling.py`): generate rollouts, filter them, and write training-ready JSONL for offline training.
 
 ## Requirements
+
 - Python 3.11+
+
 - PyTorch >= 2.8.0 with CUDA for training examples
+
 - vLLM server exposing the OpenAI API; NCCL available if you want live weight pushes
+
 - Redis for the pipeline RL actor/trainer example
 
 ## Installation
-Using [uv](https://github.com/astral-sh/uv) (recommended because `uv.lock` is checked in):
+
+Using [uv](https://github.com/astral-sh/uv):
+
 ```bash
-uv sync --group dev   # installs runtime + dev/test deps
+uv sync
 ```
 
-## Running tests
+For running example code use:
+
 ```bash
-uv run pytest              # unit suite
-uv run pytest -m gpu       # GPU-marked tests (if available)
+uv sync --group examples
 ```
 
-## Architectural flow (story edition)
-1) Define envs as pure state machines; keep agent harnesses separate so you can reuse prompts, parsers, and tools across envs.  
-2) Wire them with an `InteractionProtocol` that owns the loop and emits rollouts.  
-3) Turn rollouts into SAWItems via a `BatchSource`: synchronous (`RolloutBatchSource`) for debugging, or pipeline (`PipelineBatchSource`) where actors push SAWItems to Redis and the trainer just pops and optimizes.  
-4) Let the Trainer stay dumb: it only sees tensors and a `weight` field; swap credit assigners (MC return, GRPO’s `GroupNormalizedReturn`, per-step, episodic) and losses without new trainer classes.  
-5) For GRPO, use `GRPORequestStrategy` to expand requests into groups sharing env seeds but varying sampling seeds; normalize returns by group and train without touching the Trainer.  
-6) Curriculum and heterogeneity are just different lists of `RolloutRequest` objects—mix Tic-Tac-Toe and GSM8K in one pass, or shift distributions over time.
+## TODO
 
-## Quickstart: synchronous training loop
-1. Start the bundled vLLM server with weight-update endpoints (no `--enable-lora`; Ludic will push merged weights itself), e.g.:
-   ```bash
-   uv run python -m ludic.inference.vllm_server \
-     --model Qwen/Qwen2.5-7B-Instruct --port 8000 --host 0.0.0.0 --dtype bfloat16
-   ```
-2. Run the Tic-Tac-Toe GRPO + LoRA trainer (requires a GPU):
-   ```bash
-   PYTHONPATH=. uv run python examples/tic_tac_toe/train_tic_tac_toe.py
-   ```
-   This wires `SingleAgentSyncProtocol` + `TicTacToeEnv` through `RolloutEngine`, expands rollouts with `GRPORequestStrategy`, and pushes updated weights to vLLM via NCCL. Defaults target `Qwen/Qwen2.5-7B-Instruct`; override `--model/--port/--host` as needed.
-
-## Pipeline RL (actor/trainer split)
-1. Start Redis locally (`redis-server`).
-2. Launch vLLM as above.
-3. In one shell start the actor (generates and pushes SAW samples to Redis):
-   ```bash
-   uv run python examples/pipeline_rl/run_actor.py
-   ```
-4. In another shell start the trainer (pulls batches from Redis, trains, and publishes weights):
-   ```bash
-   uv run python examples/pipeline_rl/run_trainer.py
-   ```
-
-## Data generation example
-Use rejection sampling to keep only winning Tic-Tac-Toe trajectories:
-```bash
-uv run python examples/rejection_sampling.py
-```
-
-## Extending Ludic
-- Build an environment: subclass `SingleAgentEnv`, implement `env_reset`, `env_step`, and optionally `suggested_sysprompt`.
-- Configure an agent: pick a context (`FullDialog`, `TruncatedThinkingContext`), a parser (`xml_tag_parser`, `think_prefix_parser`, compose as needed), and a `ChatClient` (vLLM or your own implementation of `ChatClient`).
-- Train: register env/protocol factories with `RolloutEngine`, feed `RolloutBatchSource` (synchronous) or `PipelineBatchSource` (Redis) into `Trainer`, and choose an algorithm (`make_reinforce`, `make_reinforce_baseline`).
-
-### Behavior notes
-- Parser failures: if a parser returns `ParseResult.action=None`, protocols will not call `env.step()` for that agent. They log a synthetic step (`info["parse_error"]=True`) with reward from the parser and feed the synthetic observation back into the agent context.
-- Tool failures: tool-calling agents record missing tools, invalid JSON args, and tool exceptions as tool messages in the context and continue the loop.
-- Algorithms shown in examples today: GSM8K uses GRPO (grouped advantages + PPO-style clip). Tic-Tac-Toe and the FSDP2 Math script use grouped-advantage REINFORCE (GRPO-style `GroupNormalizedReturn`).
+- Add on-policy distillation, plus a script for the MOPD variant introduced in: https://github.com/XiaomiMiMo/MiMo-V2-Flash/blob/main/paper.pdf
+- Introduce a sensible object for sampling arguments (so we don’t have to use brittle dicts).
+- Improve packaging:
+	- `eval`, `training`, and `batch_gen` should be distinct modules.
+- Add a classic Gym-style registry for agent harnesses, environments, and interaction protocols (so they don’t have to be built on the fly).
+- Use proper FSDP2 wrapping (I was new to FSDP2, but now I know better)
+- Add Single Stream Policy Optimization (as described in https://arxiv.org/abs/2509.13232v2).
+- Move to a token-in / token-out API.
+- Make `scripts/push_to_hub.py` work with `--revision` for uploading different checkpoints.
+- Add a progress bar to eval.
