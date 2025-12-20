@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.13.2",
+    "beartype>=0.22.9",
+    "jaxtyping>=0.3.4",
     "openai>=2.7.1",
     "peft>=0.18.0",
     "rich>=14.2.0",

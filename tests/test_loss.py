@@ -180,7 +180,7 @@ def test_composite_loss():
     composite_loss = CompositeLoss(terms=[term1, term2])
 
     # These inputs don't matter since the mock losses ignore them
-    dummy_logits = torch.empty(0)
+    dummy_logits = torch.zeros((1, 2, 3), dtype=torch.float32)
     dummy_batch = {}
 
     loss, stats = composite_loss.compute(dummy_logits, dummy_batch)

@@ -1,14 +1,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Protocol, Tuple, List
+import logging
+import os
+from beartype.typing import Any, Dict, Mapping, Protocol, Tuple, List
 
+from beartype import beartype
+from jaxtyping import Float, Int, jaxtyped
 import torch
 from torch import Tensor
 import torch.nn.functional as F
 
 
 Batch = Mapping[str, Tensor]
+Logits = Float[Tensor, "B T V"]
+TokenIds = Int[Tensor, "B T"]
+Mask = Float[Tensor, "B T"]
+Weights = Float[Tensor, "B"]
+
+logger = logging.getLogger(__name__)
+
+def _no_op(fn):
+    return fn
+
+_TYPECHECK_ENABLED = os.getenv("LUDIC_TYPECHECK", "0") == "1"
+typechecker = beartype if _TYPECHECK_ENABLED else _no_op
+logger.info(
+    "Jaxtyping runtime checks: %s",
+    "enabled (beartype)" if _TYPECHECK_ENABLED else "disabled",
+)
 
 
 class Loss(Protocol):
@@ -17,13 +37,14 @@ class Loss(Protocol):
     (scalar_loss, stats).
     """
 
-    def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
         ...
 
 # We define this as a standalone helper so torch.compile can cache it cleanly.
 # dynamic=True is critical for varying sequence lengths (preventing recompilation).
+@jaxtyped(typechecker=typechecker)
 @torch.compile(dynamic=True)
-def selective_log_softmax(logits: Tensor, index: Tensor) -> Tensor:
+def selective_log_softmax(logits: Logits, index: TokenIds) -> Float[Tensor, "B T"]:
     """
     Fused kernel for log_softmax + gather.
     
@@ -35,13 +56,14 @@ def selective_log_softmax(logits: Tensor, index: Tensor) -> Tensor:
     logprobs = logits.log_softmax(dim=-1)
     return torch.gather(logprobs, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
 
+@jaxtyped(typechecker=typechecker)
 def compute_logp_action(
-    logits: Tensor, 
-    input_ids: Tensor, 
-    action_mask: Tensor,
+    logits: Logits,
+    input_ids: TokenIds,
+    action_mask: Mask,
     *,
     length_normalize: bool = False,
-) -> Tensor:
+) -> Weights:
     """
     Compute log π(a|s) given token-level logits and an action mask.
 
@@ -96,7 +118,8 @@ class ReinforceLoss:
     """
     length_normalize: bool = False
 
-    def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+    @jaxtyped(typechecker=typechecker)
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
         input_ids = batch["input_ids"]            # [B, T]
         action_mask = batch["action_mask"]        # [B, T]
         advantages = batch["weight"]              # [B]
@@ -137,7 +160,8 @@ class MaskedCausalLMCrossEntropyLoss:
 
     length_normalize: bool = True
 
-    def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+    @jaxtyped(typechecker=typechecker)
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
         input_ids = batch["input_ids"]  # [B, T]
         action_mask = batch["action_mask"]  # [B, T]
         weights = batch.get("weight")
@@ -197,7 +221,8 @@ class ReinforceBaselineLoss:
     normalize: bool = False
     length_normalize: bool = False
 
-    def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+    @jaxtyped(typechecker=typechecker)
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
         input_ids = batch["input_ids"]
         action_mask = batch["action_mask"]
         adv_raw = batch["weight"]                # [B]
@@ -248,7 +273,8 @@ class ClippedSurrogateLoss:
     old_logp_key: str = "old_logp_action"
     length_normalize: bool = False
 
-    def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+    @jaxtyped(typechecker=typechecker)
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
         input_ids = batch["input_ids"]
         action_mask = batch["action_mask"]
         advantages = batch["weight"]              # [B]
@@ -316,7 +342,8 @@ class KLLoss:
     old_logp_key: str = "old_logp_action"
     length_normalize: bool = False
 
-    def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+    @jaxtyped(typechecker=typechecker)
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
         input_ids = batch["input_ids"]
         action_mask = batch["action_mask"]
         old_logp = batch[self.old_logp_key]       # [B]
@@ -357,7 +384,8 @@ class EntropyBonus:
 
     coeff: float = 0.01
 
-    def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+    @jaxtyped(typechecker=typechecker)
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
         action_mask = batch["action_mask"]
 
         logprobs = torch.log_softmax(logits, dim=-1)
@@ -423,7 +451,8 @@ class CompositeLoss:
 
     terms: List[LossTerm]
 
-    def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+    @jaxtyped(typechecker=typechecker)
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
         if not self.terms:
             raise ValueError("CompositeLoss.terms must be non-empty")
 

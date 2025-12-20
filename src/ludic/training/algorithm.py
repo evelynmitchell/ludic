@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Protocol
 
+from jaxtyping import Float
 from torch import nn, Tensor
 
 from ludic.training.types import CreditAssigner, SAWBatch
@@ -17,6 +18,7 @@ from ludic.training.credit_assignment import MonteCarloReturn, GroupNormalizedRe
 
 
 Batch = Mapping[str, Tensor]
+Logits = Float[Tensor, "B T V"]
 
 class PreprocessFn(Protocol):
     def __call__(self, saw_batch: SAWBatch) -> SAWBatch: ...
@@ -54,7 +56,7 @@ class RLAlgorithm:
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
-        logits: Tensor = outputs.logits
+        logits: Logits = outputs.logits
 
         # Pass the resulting logits to the loss function
         return self.loss.compute(logits, batch)
