@@ -256,7 +256,7 @@ class Trainer:
         # ---- Gradient Checkpointing Setup ----------------------------
         if enable_gradient_checkpointing:
             logger.info("🛡️ Enabling Gradient Checkpointing (Activation Checkpointing)...")
-            
+
             # 1. Enable on the model (HuggingFace standard API)
             if hasattr(self.model, "gradient_checkpointing_enable"):
                 self.model.gradient_checkpointing_enable()
@@ -535,25 +535,25 @@ class Trainer:
         self.model.train()
 
         for micro_step_idx in range(grad_accum_steps):
-            
+
             # ---- 1a) Sample Valid Micro-batch (with Rejection Loop) ----
             # For PipelineRL, we might receive stale data from the queue.
             # We loop until we get a batch containing at least one fresh item.
             while True:
                 saw_batch: SAWBatch = await self._batch_source.next_batch()
-                
+
                 # If configured, filter out items that exceed max_lag.
                 if self.cfg.max_lag is not None:
                     current_time = self._train_step_idx
                     limit = self.cfg.max_lag
-                    
+
                     fresh_items = []
                     for item in saw_batch.items:
                         # Default to current_time (0 lag) if tag is missing
                         item_ver = item.meta.get("policy_version", current_time)
                         if (current_time - item_ver) <= limit:
                             fresh_items.append(item)
-                    
+
                     # Update the batch with only fresh items
                     saw_batch.items = fresh_items
 
@@ -643,11 +643,12 @@ class Trainer:
             all_micro_stats.append(stats)
 
         # ---- 2) Gradient Clipping (after loop) -------------------------
-        if self.cfg.max_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.cfg.max_grad_norm,
-            )
+        max_norm = self.cfg.max_grad_norm
+        grad_norm: Optional[float] = None
+
+        if max_norm is not None:
+            gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+            grad_norm = float(gn)
 
         # ---- 3) Optimizer Step (one step for the macro-batch) ----------
         self.optimizer.step()
@@ -664,6 +665,8 @@ class Trainer:
 
         # ---- 6) Enrich stats -------------------------------------------
         final_stats = aggregate_stats(all_micro_stats, all_saw_batches, reducers=self.reducers)
+        if grad_norm is not None:
+            final_stats["grad_norm"] = float(grad_norm)
         final_stats["train_step"] = float(self._train_step_idx)
 
         final_stats = self._maybe_reduce_stats_across_ranks(final_stats, device=device)
@@ -981,14 +984,14 @@ class Trainer:
                 for name, p in self.model.named_parameters():
                     # Optimization: In LoRA, only send what we touched (plus what needs fusion)
                     # If not PEFT, only send requires_grad.
-                    # If PEFT (merged), we theoretically need to send the whole base layer 
+                    # If PEFT (merged), we theoretically need to send the whole base layer
                     # because it changed.
-                    
+
                     # If standard training: send only requires_grad=True
                     # If LoRA (merged): send everything (because base weights need updating in vLLM)
                     if not is_peft and not p.requires_grad:
                         continue
-                        
+
                     if self.param_filter is not None:
                         if not self.param_filter(name, p):
                             continue
