@@ -4,9 +4,9 @@ Generate synthetic training data for Tic-Tac-Toe SFT.
 This script:
 1. Generates rollouts using FullDialog (model sees full thinking history)
 2. Filters to keep only winning trajectories (rejection sampling)
-3. Post-hoc rebuilds prompts that mimic TruncatedThinkingContext:
+3. Optionally rebuilds prompts to mimic TruncatedThinkingContext:
    prior assistant turns become <think>[TRUNCATED]</think><answer>, but the
-   action for the current step stays intact.
+   action for the current step stays intact. (--no-transform keeps full history)
 4. Saves lean JSONL (minimal fields; we retokenize downstream) for use with
    OfflineBatchSource + make_sft()
 
@@ -64,46 +64,6 @@ def is_win(r: Rollout) -> bool:
     return get_result(r) == "win"
 
 
-def rollout_to_dict(r: Rollout, *, lean: bool = True) -> dict[str, Any]:
-    """
-    Convert a Rollout to a JSON-serializable dict.
-
-    If lean=True (default), drop heavy metadata so the JSONL stays small
-    (we retokenize downstream anyway).
-    """
-    steps = []
-    for s in r.steps:
-        step: Dict[str, Any] = {
-            "index": s.index,
-            "prev_obs": s.prev_obs,
-            "action": s.action,
-            "reward": s.reward,
-            "truncated": s.truncated,
-            "terminated": s.terminated,
-        }
-        if not lean:
-            step.update(
-                {
-                    "next_obs": s.next_obs,
-                    "info": s.info,
-                    "ts_ns": s.ts_ns,
-                }
-            )
-        steps.append(step)
-
-    rollout_dict: Dict[str, Any] = {"id": r.id, "steps": steps}
-    if not lean:
-        rollout_dict.update(
-            {
-                "meta": r.meta,
-                "total_reward": r.total_reward,
-                "length": r.length,
-                "duration_ns": r.duration_ns,
-            }
-        )
-    return rollout_dict
-
-
 STRICT_THINK_PATTERN = re.compile(
     r"^(\s*<think>)(.*?)(</think>\s*)(.+)$",
     flags=re.DOTALL | re.IGNORECASE,
@@ -134,12 +94,29 @@ def _messages_to_prompt(messages: List[dict[str, str]]) -> str:
     return "\n\n".join(parts)
 
 
-def apply_truncated_prompt(
+def _truncate_history_messages(
+    messages: List[dict[str, str]],
+    placeholder: str,
+) -> List[dict[str, str]]:
+    truncated: List[dict[str, str]] = []
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            content = msg.get("content", "")
+            new_msg = dict(msg)
+            new_msg["content"] = _truncate_assistant_text(content, placeholder)
+            truncated.append(new_msg)
+        else:
+            truncated.append(msg)
+    return truncated
+
+
+def apply_prompt_format(
     rollout: Rollout,
     *,
     system_prompt: str,
     placeholder: str = "[TRUNCATED]",
     lean: bool = True,
+    truncate_history: bool = True,
 ) -> dict[str, Any]:
     """
     Build per-step prompts that mirror what the agent saw:
@@ -151,10 +128,17 @@ def apply_truncated_prompt(
         history.append({"role": "system", "content": system_prompt})
 
     for s in rollout.steps:
-        chat_messages: List[dict[str, str]] = list(history)
+        full_messages: List[dict[str, str]] = list(history)
         # Ensure current observation is present as the latest user turn
-        if not chat_messages or chat_messages[-1].get("role") != "user" or chat_messages[-1].get("content") != s.prev_obs:
-            chat_messages.append({"role": "user", "content": s.prev_obs})
+        if (
+            not full_messages
+            or full_messages[-1].get("role") != "user"
+            or full_messages[-1].get("content") != s.prev_obs
+        ):
+            full_messages.append({"role": "user", "content": s.prev_obs})
+
+        truncated_messages = _truncate_history_messages(full_messages, placeholder)
+        chat_messages = truncated_messages if truncate_history else list(full_messages)
 
         prompt_text = _messages_to_prompt(chat_messages)
 
@@ -180,12 +164,13 @@ def apply_truncated_prompt(
         # Store chat-format prompt/completion for downstream apply_chat_template
         info_field = step_dict.setdefault("info", {}) or {}
         info_field["chat_prompt_messages"] = chat_messages
+        info_field["chat_prompt_messages_full"] = list(full_messages)
         info_field["chat_completion"] = {"role": "assistant", "content": s.action}
         step_dict["info"] = info_field
         steps.append(step_dict)
 
-        # Update history to include this action and next observation (if any)
-        history = list(chat_messages)
+        # Update full history to include this action and next observation (if any)
+        history = list(full_messages)
         history.append({"role": "assistant", "content": s.action})
         if s.next_obs is not None:
             history.append({"role": "user", "content": s.next_obs})
@@ -284,15 +269,13 @@ async def generate_synth_data(args: argparse.Namespace) -> None:
         for r in rollouts:
             # Filter by result label, not reward (parser rewards can inflate totals)
             if is_win(r):
-                if args.transform:
-                    rollout_dict = apply_truncated_prompt(
-                        r,
-                        system_prompt=prompt_text,
-                        placeholder=args.placeholder,
-                        lean=args.lean,
-                    )
-                else:
-                    rollout_dict = rollout_to_dict(r, lean=args.lean)
+                rollout_dict = apply_prompt_format(
+                    r,
+                    system_prompt=prompt_text,
+                    placeholder=args.placeholder,
+                    lean=args.lean,
+                    truncate_history=args.transform,
+                )
 
                 f.write(json.dumps(rollout_dict, ensure_ascii=False) + "\n")
                 accepted += 1
@@ -320,9 +303,9 @@ def main():
 
     # Transformation
     parser.add_argument("--transform", action="store_true", default=True,
-                        help="Transform to TruncatedThinking format (default: True)")
+                        help="Truncate history to TruncatedThinking format (default: True)")
     parser.add_argument("--no-transform", action="store_false", dest="transform",
-                        help="Keep raw FullDialog format")
+                        help="Keep full assistant history in prompts")
     parser.add_argument("--placeholder", default="[TRUNCATED]",
                         help="Placeholder for truncated thinking blocks")
     parser.add_argument("--lean", action="store_true", default=True,

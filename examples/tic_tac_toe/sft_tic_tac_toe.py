@@ -12,6 +12,7 @@ The SFT phase teaches the model:
 - The <think>...</think><move>X</move> format
 - The [TRUNCATED THOUGHTS] convention in history
 - Basic Tic-Tac-Toe strategy from winning examples
+Use --ctx full to train on full (untruncated) history prompts.
 
 This variant runs full-finetune FSDP2 over 2 GPUs (torchrun). No eval, no LoRA, no vLLM; it just prints loss.
 Launch with:
@@ -23,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 from pathlib import Path
 
 import torch
@@ -30,6 +32,7 @@ import torch.distributed as dist
 from torch.distributed import fsdp
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from ludic.types import Step
 from ludic.training import (
     OfflineBatchSource,
     Trainer,
@@ -43,6 +46,81 @@ from ludic.training import (
 # ---------------------------------------------------------------------------
 # Distributed init
 # ---------------------------------------------------------------------------
+
+STRICT_THINK_PATTERN = re.compile(
+    r"^(\s*<think>)(.*?)(</think>\s*)(.+)$",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+
+
+def _truncate_assistant_text(text: str, placeholder: str) -> str:
+    m = STRICT_THINK_PATTERN.match(text)
+    if not m:
+        return text
+    return f"{m.group(1)}{placeholder}{m.group(3)}{m.group(4)}"
+
+
+def _truncate_history_messages(
+    messages: list[dict[str, str]],
+    placeholder: str,
+) -> list[dict[str, str]]:
+    truncated: list[dict[str, str]] = []
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            content = msg.get("content", "")
+            new_msg = dict(msg)
+            new_msg["content"] = _truncate_assistant_text(content, placeholder)
+            truncated.append(new_msg)
+        else:
+            truncated.append(msg)
+    return truncated
+
+
+def _with_truncated_history(step: Step, placeholder: str) -> Step:
+    info = step.info or {}
+    full_messages = info.get("chat_prompt_messages_full")
+    if full_messages:
+        truncated = _truncate_history_messages(full_messages, placeholder)
+    else:
+        chat_messages = info.get("chat_prompt_messages")
+        if not chat_messages:
+            return step
+        truncated = _truncate_history_messages(chat_messages, placeholder)
+    new_info = dict(info)
+    new_info["chat_prompt_messages"] = truncated
+    return Step(
+        index=step.index,
+        prev_obs=step.prev_obs,
+        action=step.action,
+        next_obs=step.next_obs,
+        reward=step.reward,
+        truncated=step.truncated,
+        terminated=step.terminated,
+        info=new_info,
+        trace=step.trace,
+        ts_ns=step.ts_ns,
+    )
+
+
+def _with_full_history(step: Step) -> Step:
+    info = step.info or {}
+    full_messages = info.get("chat_prompt_messages_full")
+    if not full_messages:
+        return step
+    new_info = dict(info)
+    new_info["chat_prompt_messages"] = full_messages
+    return Step(
+        index=step.index,
+        prev_obs=step.prev_obs,
+        action=step.action,
+        next_obs=step.next_obs,
+        reward=step.reward,
+        truncated=step.truncated,
+        terminated=step.terminated,
+        info=new_info,
+        trace=step.trace,
+        ts_ns=step.ts_ns,
+    )
 
 
 def init_dist(local_rank: int) -> int:
@@ -87,6 +165,17 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable HF gradient checkpointing.",
+    )
+    parser.add_argument(
+        "--ctx",
+        choices=["full", "truncated"],
+        default="truncated",
+        help="Prompt history format for SFT: full or TruncatedThinking-style.",
+    )
+    parser.add_argument(
+        "--placeholder",
+        default="[TRUNCATED]",
+        help="Placeholder token for truncated <think> blocks.",
     )
     args = parser.parse_args()
 
@@ -136,7 +225,15 @@ def main() -> None:
     algo = make_sft(length_normalize=True)
 
     # Create step_to_item function with chat template preprocessing
-    step_to_item = make_chat_template_step_to_item(tokenizer)
+    base_step_to_item = make_chat_template_step_to_item(tokenizer)
+    if args.ctx == "truncated":
+        def step_to_item(rollout, step, weight):
+            truncated_step = _with_truncated_history(step, args.placeholder)
+            return base_step_to_item(rollout, truncated_step, weight)
+    else:
+        def step_to_item(rollout, step, weight):
+            full_step = _with_full_history(step)
+            return base_step_to_item(rollout, full_step, weight)
 
     batch_source = OfflineBatchSource(
         jsonl_paths=[data_path],
